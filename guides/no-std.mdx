@@ -1,0 +1,115 @@
+---
+title: "no_std support"
+description: "Building smoltcp for targets without the Rust standard library."
+---
+
+smoltcp supports three memory models that cover the full range of Rust targets — from hosted Linux processes down to microcontrollers with a few kilobytes of RAM.
+
+## The three memory models
+
+| Model | Feature | Rust channel | Buffer ownership |
+|---|---|---|---|
+| Standard library | `std` | Stable | `Box` and `Vec` via `std` |
+| Alloc only | `alloc` | Nightly | `Box` and `Vec` via `alloc` crate |
+| Neither | _(none)_ | Stable | Caller-supplied static slices |
+
+<Tabs>
+  <Tab title="std (default)">
+    The `std` feature is enabled by default. It allows smoltcp to own socket buffers through `std::boxed::Box` and `std::vec::Vec`, so you can allocate them with normal Rust heap APIs.
+
+    ```toml
+    [dependencies]
+    smoltcp = "0.13.0"  # std is on by default
+    ```
+
+    This is the easiest mode to get started with on Linux and other hosted platforms. It also automatically enables the `alloc` feature.
+  </Tab>
+  <Tab title="alloc (nightly only)">
+    The `alloc` feature uses the `alloc` crate instead of `std`, giving you heap-backed socket buffers on targets that have a global allocator but not the full standard library — for example, an embedded target using `embedded-alloc`.
+
+    ```toml
+    [dependencies]
+    smoltcp = { version = "0.13.0", default-features = false, features = [
+        "alloc",
+        "proto-ipv4",
+        "socket-tcp",
+        "medium-ethernet",
+    ] }
+    ```
+
+    <Note>
+      The `alloc` feature currently requires a nightly Rust compiler. If you need stable Rust on an embedded target, use the static-slice model instead.
+    </Note>
+  </Tab>
+  <Tab title="no_std, no alloc (stable)">
+    With neither `std` nor `alloc`, all socket buffers must be statically allocated slices that you hand to smoltcp at startup. This is the most portable option: it works with stable Rust 1.91 and later, on any target, with zero runtime memory allocation.
+
+    ```toml
+    [dependencies]
+    smoltcp = { version = "0.13.0", default-features = false, features = [
+        "proto-ipv4",
+        "socket-tcp",
+        "medium-ethernet",
+        "log",
+    ] }
+    ```
+  </Tab>
+</Tabs>
+
+## Static buffer pattern
+
+When building without `std` or `alloc`, declare your buffers as `static mut` arrays. This guarantees they are placed in a fixed RAM region by the linker, making it easy to verify they fit alongside your stack and other variables.
+
+```rust
+#![no_std]
+#![no_main]
+
+use smoltcp::socket::tcp;
+use smoltcp::iface::SocketSet;
+
+// Declare static buffers for a single TCP socket.
+static mut TCP_RX_BUFFER: [u8; 1536] = [0; 1536];
+static mut TCP_TX_BUFFER: [u8; 1536] = [0; 1536];
+
+// In your initialization code:
+// Safety: these statics are written once at startup and then owned by smoltcp.
+let rx_buf = tcp::SocketBuffer::new(unsafe { &mut TCP_RX_BUFFER[..] });
+let tx_buf = tcp::SocketBuffer::new(unsafe { &mut TCP_TX_BUFFER[..] });
+let socket = tcp::Socket::new(rx_buf, tx_buf);
+```
+
+The same pattern applies to UDP, ICMP, DNS, and DHCP sockets — each socket type has its own `SocketBuffer` or equivalent type that accepts a `&mut [u8]` slice.
+
+## SocketSet without alloc
+
+`SocketSet` also needs storage for the socket handles it manages. Provide a fixed-size array:
+
+```rust
+use smoltcp::iface::SocketSet;
+
+// Storage for up to 4 sockets.
+let mut socket_storage: [_; 4] = Default::default();
+let mut sockets = SocketSet::new(&mut socket_storage[..]);
+
+let handle = sockets.add(socket);
+```
+
+The array length determines the maximum number of concurrent sockets. Attempting to add more sockets than slots panics.
+
+## Running the loopback example without std
+
+The `loopback` example ships with smoltcp and demonstrates a minimal no_std setup. It uses the `alloc` feature (nightly) for the socket buffers:
+
+```sh
+cargo run --example loopback --no-default-features --features="log proto-ipv4 socket-tcp alloc"
+```
+
+With `std` enabled (the default), the example also supports packet capture and fault injection:
+
+```sh
+cargo run --example loopback -- --pcap loopback.pcap
+```
+
+## MSRV
+
+smoltcp compiles on **stable Rust 1.91** and later when using the `std` or static-slice models. The `alloc`-only model currently requires a nightly compiler.

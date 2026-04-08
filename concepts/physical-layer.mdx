@@ -1,0 +1,264 @@
+---
+title: "Physical layer"
+description: "Implementing the Device trait to connect smoltcp to your network hardware."
+---
+
+The physical layer (`smoltcp::phy`) is the boundary between smoltcp and your hardware. It defines three traits — `Device`, `RxToken`, and `TxToken` — that you implement once for your network controller. Everything above this layer (the interface, sockets, protocol logic) is hardware-agnostic.
+
+## The Device trait
+
+```rust
+pub trait Device {
+    type RxToken<'a>: RxToken where Self: 'a;
+    type TxToken<'a>: TxToken where Self: 'a;
+
+    fn receive(&mut self, timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)>;
+    fn transmit(&mut self, timestamp: Instant) -> Option<Self::TxToken<'_>>;
+    fn capabilities(&self) -> DeviceCapabilities;
+}
+```
+
+`receive()` checks whether an incoming frame is available. If one is, it returns a pair of tokens: an `RxToken` wrapping the received frame, and a `TxToken` that can be used to send a reply. The paired `TxToken` lets smoltcp send responses — such as ARP replies or ICMP echo replies — without requiring a separate buffer allocation.
+
+`transmit()` returns a `TxToken` for sending an outgoing frame initiated by a socket, or `None` if the device TX queue is full.
+
+`capabilities()` describes the device's fixed properties. smoltcp calls this once during `Interface::new()` and caches the result.
+
+## RxToken and TxToken
+
+The token design ensures that the raw frame buffer is accessed only inside the closure, which allows zero-copy implementations backed by DMA descriptors or ring buffers:
+
+```rust
+pub trait RxToken {
+    fn consume<R, F>(self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R;
+
+    fn meta(&self) -> PacketMeta { PacketMeta::default() }
+}
+
+pub trait TxToken {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R;
+
+    fn set_meta(&mut self, meta: PacketMeta) {}
+}
+```
+
+`RxToken::consume()` gives you a read-only view of the received bytes. `TxToken::consume()` gives you a mutable slice of `len` bytes; you fill in the packet and the token sends it when the closure returns.
+
+## DeviceCapabilities
+
+`DeviceCapabilities` describes what your hardware can do:
+
+```rust
+pub struct DeviceCapabilities {
+    pub medium: Medium,
+    pub max_transmission_unit: usize,
+    pub max_burst_size: Option<usize>,
+    pub checksum: ChecksumCapabilities,
+}
+```
+
+| Field | Description |
+|---|---|
+| `medium` | The framing type — `Ethernet`, `Ip`, or `Ieee802154`. Determines whether smoltcp performs ARP/NDISC and adds Ethernet headers. |
+| `max_transmission_unit` | Maximum frame size in bytes. For Ethernet devices this includes the 14-byte Ethernet header but not the 4-byte FCS. For IP-medium devices it is the IP MTU directly. |
+| `max_burst_size` | How many MTU-sized frames the device can send or receive in one burst. `None` means unbounded (e.g. when using dynamically allocated buffers). |
+| `checksum` | Per-protocol checksum offload configuration. If your hardware computes or verifies a checksum, set the corresponding field to `Checksum::None` to skip redundant software computation. |
+
+`ip_mtu()` derives the IP MTU from `max_transmission_unit` and `medium`, subtracting the Ethernet header length when the medium is `Ethernet`.
+
+## The Medium enum
+
+```rust
+pub enum Medium {
+    Ethernet,     // Ethernet, WiFi (802.11), tap interfaces, layer-2 VPNs
+    Ip,           // Linux tun, PPP, layer-3 VPNs — no MAC addresses, no ARP
+    Ieee802154,   // Low-rate wireless personal area networks (6LoWPAN)
+}
+```
+
+The medium you choose affects:
+- Whether `Interface` performs ARP (IPv4) or NDISC (IPv6) neighbor discovery.
+- Whether an Ethernet header is prepended to outgoing IP packets.
+- Whether the hardware address in `Config` must be an Ethernet MAC, an IEEE 802.15.4 address, or `HardwareAddress::Ip`.
+
+## Implementing Device for hardware
+
+Here is a complete implementation for a hypothetical STM32-class Ethernet controller that uses two static DMA buffers:
+
+```rust
+use smoltcp::phy::{self, DeviceCapabilities, Device, Medium};
+use smoltcp::time::Instant;
+
+struct StmPhy {
+    rx_buffer: [u8; 1536],
+    tx_buffer: [u8; 1536],
+}
+
+impl StmPhy {
+    fn new() -> StmPhy {
+        StmPhy {
+            rx_buffer: [0; 1536],
+            tx_buffer: [0; 1536],
+        }
+    }
+}
+
+impl phy::Device for StmPhy {
+    type RxToken<'a> = StmPhyRxToken<'a> where Self: 'a;
+    type TxToken<'a> = StmPhyTxToken<'a> where Self: 'a;
+
+    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        // In a real driver, check the DMA descriptor ring for a received frame.
+        Some((
+            StmPhyRxToken(&mut self.rx_buffer[..]),
+            StmPhyTxToken(&mut self.tx_buffer[..]),
+        ))
+    }
+
+    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        // In a real driver, check that the TX descriptor ring has a free slot.
+        Some(StmPhyTxToken(&mut self.tx_buffer[..]))
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut caps = DeviceCapabilities::default();
+        caps.max_transmission_unit = 1536;
+        caps.max_burst_size = Some(1);
+        caps.medium = Medium::Ethernet;
+        caps
+    }
+}
+
+struct StmPhyRxToken<'a>(&'a mut [u8]);
+
+impl<'a> phy::RxToken for StmPhyRxToken<'a> {
+    fn consume<R, F>(self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        // In a real driver, the buffer is already filled by DMA before this call.
+        let result = f(self.0);
+        // Mark the DMA descriptor as free here.
+        result
+    }
+}
+
+struct StmPhyTxToken<'a>(&'a mut [u8]);
+
+impl<'a> phy::TxToken for StmPhyTxToken<'a> {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        let result = f(&mut self.0[..len]);
+        // Trigger DMA transmission here.
+        result
+    }
+}
+```
+
+## Built-in device implementations
+
+<Tabs>
+  <Tab title="Loopback">
+    `smoltcp::phy::Loopback` is an in-memory device useful for unit tests and integration tests that do not require a real network. Frames transmitted into the loopback device become immediately available for reception.
+
+    Requires the `alloc` feature.
+
+    ```rust
+    use smoltcp::phy::Loopback;
+    use smoltcp::phy::Medium;
+
+    let mut device = Loopback::new(Medium::Ethernet);
+    ```
+  </Tab>
+  <Tab title="RawSocket">
+    `smoltcp::phy::RawSocket` opens a Linux raw socket (`AF_PACKET`) and sends/receives real Ethernet frames on a named network interface. Useful for running smoltcp on a Linux host for development and testing.
+
+    Requires the `phy-raw_socket` feature and a Linux host. The process must have `CAP_NET_RAW`.
+
+    ```rust
+    #[cfg(all(feature = "phy-raw_socket", unix))]
+    {
+        use smoltcp::phy::RawSocket;
+        let mut device = RawSocket::new("eth0", Medium::Ethernet).unwrap();
+    }
+    ```
+  </Tab>
+  <Tab title="TunTapInterface">
+    `smoltcp::phy::TunTapInterface` opens a Linux TUN (layer-3) or TAP (layer-2) interface. Use TUN mode with `Medium::Ip` when you want IP-only framing; use TAP mode with `Medium::Ethernet` when you need Ethernet framing.
+
+    Requires the `phy-tuntap_interface` feature and Linux or Android.
+
+    ```rust
+    #[cfg(feature = "phy-tuntap_interface")]
+    {
+        use smoltcp::phy::{Medium, TunTapInterface};
+        // TAP interface (Ethernet medium)
+        let mut device = TunTapInterface::new("tap0", Medium::Ethernet).unwrap();
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Middleware devices
+
+Middleware devices wrap any `Device` implementation and intercept the token stream, adding observability or fault injection without changing your driver code.
+
+<Tabs>
+  <Tab title="Tracer">
+    `smoltcp::phy::Tracer` prints a human-readable tcpdump-style representation of every frame that passes through the device. Useful during development.
+
+    ```rust
+    use smoltcp::phy::Tracer;
+
+    let mut device = Tracer::new(your_device, |_timestamp, _direction, packet| {
+        println!("{}", packet);
+    });
+    ```
+
+    `TracerDirection` distinguishes received frames (`Rx`) from transmitted frames (`Tx`). The callback receives a `TracerPacket` that implements `Display` with a formatted packet summary.
+  </Tab>
+  <Tab title="FaultInjector">
+    `smoltcp::phy::FaultInjector` randomly drops or corrupts frames according to configurable probability settings. Use it to stress-test your protocol logic under lossy conditions.
+
+    ```rust
+    use smoltcp::phy::FaultInjector;
+
+    let mut device = FaultInjector::new(your_device, /* random_seed */ 42);
+    device.set_drop_chance(10);    // drop ~10% of frames
+    device.set_corrupt_chance(5);  // corrupt ~5% of frames
+    ```
+  </Tab>
+</Tabs>
+
+## PacketMeta and the packetmeta-id feature
+
+`PacketMeta` is a struct that travels alongside each packet through the stack:
+
+```rust
+#[non_exhaustive]
+pub struct PacketMeta {
+    #[cfg(feature = "packetmeta-id")]
+    pub id: u32,
+}
+```
+
+When no feature is enabled, `PacketMeta` is zero-sized and the compiler eliminates it entirely. When `packetmeta-id` is enabled, each packet carries a 32-bit identifier you can use to correlate transmitted frames with hardware-level events (for example, TX completion interrupts).
+
+Set metadata on a `TxToken` before consuming it:
+
+```rust
+let mut meta = smoltcp::phy::PacketMeta::default();
+#[cfg(feature = "packetmeta-id")]
+{
+    meta.id = next_packet_id();
+}
+tx_token.set_meta(meta);
+```
+
+Retrieve metadata from a received frame via `RxToken::meta()`, or from a UDP socket's `UdpMetadata::meta` field after a successful `recv()`.

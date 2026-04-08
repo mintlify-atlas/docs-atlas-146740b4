@@ -1,0 +1,229 @@
+---
+title: "Feature flags"
+description: "Configure smoltcp by enabling only the protocols and features your project needs."
+---
+
+smoltcp uses Cargo feature flags extensively to keep binary size under control. On a constrained embedded target every kilobyte matters, so the library ships with no protocol or socket type compiled in unless you ask for it.
+
+The default feature set is designed for easy evaluation on a hosted machine. For any serious embedded deployment you should start from `default-features = false` and add exactly what you need.
+
+<Note>
+  You must enable at least one protocol feature (`proto-ipv4`, `proto-ipv6`, or `proto-sixlowpan`) and at least one medium feature (`medium-ethernet`, `medium-ip`, or `medium-ieee802154`) for the crate to compile when sockets are enabled.
+</Note>
+
+## Default feature set
+
+The following features are enabled when you add smoltcp without `default-features = false`:
+
+```toml
+# Enabled by default
+std, log,
+medium-ethernet, medium-ip, medium-ieee802154,
+phy-raw_socket, phy-tuntap_interface,
+proto-ipv4, proto-dhcpv4, proto-ipv6, proto-ipv6-slaac, proto-dns,
+proto-ipv4-fragmentation, proto-sixlowpan-fragmentation,
+socket-raw, socket-icmp, socket-udp, socket-tcp,
+socket-dhcpv4, socket-dns, socket-mdns,
+packetmeta-id, async, multicast, auto-icmp-echo-reply
+```
+
+## Configuration examples
+
+<CodeGroup>
+
+```toml Minimal no_std embedded (IPv4 + TCP only)
+[dependencies]
+smoltcp = { version = "0.13.0", default-features = false, features = [
+    "log",
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+] }
+```
+
+```toml Full-featured hosted
+[dependencies]
+smoltcp = "0.13.0"
+# All default features are already included
+```
+
+```toml IoT node (6LoWPAN over IEEE 802.15.4)
+[dependencies]
+smoltcp = { version = "0.13.0", default-features = false, features = [
+    "defmt",
+    "medium-ieee802154",
+    "proto-sixlowpan",
+    "proto-sixlowpan-fragmentation",
+    "socket-udp",
+] }
+```
+
+```toml IPv6 with SLAAC and DNS
+[dependencies]
+smoltcp = { version = "0.13.0", default-features = false, features = [
+    "log",
+    "medium-ethernet",
+    "proto-ipv6",
+    "proto-ipv6-slaac",
+    "proto-dns",
+    "socket-tcp",
+    "socket-udp",
+    "socket-dns",
+] }
+```
+
+</CodeGroup>
+
+## Feature reference
+
+<AccordionGroup>
+
+<Accordion title="Runtime environment: std, alloc, log, defmt, verbose">
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `std` | Yes | Enables heap-backed types via `std::boxed::Box` and `std::vec::Vec`. Implies `alloc`. |
+| `alloc` | No | Enables heap-backed types via the `alloc` crate without `std`. Useful for `no_std` targets with a global allocator. |
+| `log` | Yes | Emits log events via the [`log`](https://crates.io/crates/log) crate. Normal events (buffer levels, TCP state changes) use `TRACE`; malformed packets use `DEBUG`. |
+| `defmt` | No | Emits log events via the [`defmt`](https://crates.io/crates/defmt) crate for embedded targets with deferred formatting. Cannot be enabled at the same time as `log`. |
+| `verbose` | No | Enables log events for high-frequency operations such as per-byte socket reads and writes. Can generate a large volume of output. |
+
+<Note>
+  `defmt` and `log` are mutually exclusive — enabling both causes a compile error.
+</Note>
+
+</Accordion>
+
+<Accordion title="Medium types: medium-ethernet, medium-ip, medium-ieee802154">
+
+The medium feature controls what kind of frames the network device produces and consumes.
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `medium-ethernet` | Yes | Ethernet II frames. Enables ARP and NDISC for address resolution. Use for Ethernet, Wi-Fi (802.11), Linux `tap`, and layer-2 VPNs. |
+| `medium-ip` | Yes | Raw IP frames with no Ethernet header. No ARP or NDISC. Use for Linux `tun`, PPP, and layer-3 VPNs. |
+| `medium-ieee802154` | Yes | IEEE 802.15.4 data frames. Required for 6LoWPAN. Implies `proto-sixlowpan`. |
+
+You must enable at least one medium feature when any socket feature is enabled.
+
+</Accordion>
+
+<Accordion title="Protocol features: proto-ipv4, proto-ipv6, proto-sixlowpan, proto-dhcpv4, proto-dns">
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `proto-ipv4` | Yes | IPv4 including checksum generation, TTL, routing, and ARP. |
+| `proto-ipv4-fragmentation` | Yes | IPv4 packet fragmentation and reassembly. Implies `proto-ipv4`. |
+| `proto-dhcpv4` | Yes | DHCPv4 client. Implies `proto-ipv4`. |
+| `proto-ipv6` | Yes | IPv6 including hop-limit, routing, and ICMPv6. |
+| `proto-ipv6-hbh` | No | IPv6 hop-by-hop extension header. Implies `proto-ipv6`. |
+| `proto-ipv6-fragmentation` | No | IPv6 packet fragmentation and reassembly. Implies `proto-ipv6`. |
+| `proto-ipv6-routing` | No | IPv6 routing extension header. Implies `proto-ipv6`. |
+| `proto-ipv6-slaac` | Yes | Stateless Address Autoconfiguration (SLAAC) for IPv6. Implies `proto-ipv6`. Requires `medium-ethernet` or `medium-ieee802154`. |
+| `proto-sixlowpan` | No | 6LoWPAN header compression and decompression (RFC 6282). Implies `proto-ipv6`. |
+| `proto-sixlowpan-fragmentation` | Yes | 6LoWPAN packet fragmentation (RFC 4944). Implies `proto-sixlowpan`. |
+| `proto-dns` | Yes | DNS query support (used by `socket-dns`). |
+| `proto-ipsec-ah` | No | IPsec Authentication Header. |
+| `proto-ipsec-esp` | No | IPsec Encapsulating Security Payload. |
+| `proto-rpl` | No | RPL routing protocol for 6LoWPAN meshes. Implies `proto-ipv6-hbh` and `proto-ipv6-routing`. |
+| `multicast` | Yes | IGMP multicast group management. |
+| `auto-icmp-echo-reply` | Yes | Automatically reply to ICMP echo requests. Disable if you want to handle pings from application code. |
+
+</Accordion>
+
+<Accordion title="Socket types: socket-tcp, socket-udp, socket-icmp, socket-raw, socket-dhcpv4, socket-dns">
+
+Each socket type is independently gated. Enable only the ones your application uses.
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `socket-tcp` | Yes | TCP socket with full state machine, congestion control, retransmission, keep-alive, and Nagle's algorithm. |
+| `socket-tcp-pause-synack` | No | Allows deferring SYN-ACK responses. Implies `socket-tcp`. |
+| `socket-udp` | Yes | UDP socket with checksum generation and validation. |
+| `socket-icmp` | Yes | ICMP socket. Can receive ICMPv4 Port Unreachable messages or messages matching a given IPv4 identifier. |
+| `socket-raw` | Yes | Raw IP socket that gives access to full IP payloads. |
+| `socket-dhcpv4` | Yes | DHCPv4 client socket. Implies `medium-ethernet` and `proto-dhcpv4`. |
+| `socket-dns` | Yes | DNS resolver socket. Implies `proto-dns`. |
+| `socket-mdns` | Yes | mDNS support. Implies `socket-dns`. |
+
+</Accordion>
+
+<Accordion title="TCP congestion control: socket-tcp-cubic, socket-tcp-reno">
+
+When no congestion control feature is enabled, TCP uses a simple algorithm with no congestion avoidance. For most embedded applications this is acceptable.
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `socket-tcp-cubic` | No | CUBIC congestion control. Used as the default controller when enabled. Relies on `f64` floating-point, which may be costly on CPUs without an FPU (e.g. Cortex-M0, Cortex-M3) and should be avoided in interrupt handlers. Implies `socket-tcp`. |
+| `socket-tcp-reno` | No | Reno congestion control. A better choice than CUBIC for targets without an FPU or in interrupt-driven contexts. Implies `socket-tcp`. |
+
+<Warning>
+  CUBIC uses `f64` arithmetic. On microcontrollers without a hardware FPU (Cortex-M0, Cortex-M1, Cortex-M3), this incurs significant CPU time and Flash usage. Use `socket-tcp-reno` instead.
+</Warning>
+
+</Accordion>
+
+<Accordion title="Physical layer adapters: phy-raw_socket, phy-tuntap_interface">
+
+These features provide ready-made `Device` implementations for Linux-hosted usage and testing.
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `phy-raw_socket` | Yes | `smoltcp::phy::RawSocket` — sends and receives raw Ethernet frames on a Linux network interface. Requires `std` and `libc`. Linux only. |
+| `phy-tuntap_interface` | Yes | `smoltcp::phy::TunTapInterface` — sends and receives frames via a Linux TUN or TAP device. Requires `std` and `libc`. Linux and Android only. |
+
+<Note>
+  Both PHY adapters depend on `std` and are not available on bare-metal targets. On embedded, you implement the `phy::Device` trait directly against your hardware driver.
+</Note>
+
+</Accordion>
+
+<Accordion title="Async support and packet metadata">
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `async` | Yes | Enables `Waker` integration so sockets can wake async tasks when data arrives or the socket state changes. |
+| `packetmeta-id` | Yes | Adds a `u32` identifier field to `PacketMeta`, allowing you to correlate transmitted UDP packets with their underlying frames. |
+
+</Accordion>
+
+</AccordionGroup>
+
+## Compile-time configuration
+
+Beyond feature flags, smoltcp exposes numeric configuration constants for buffer counts and sizes. You can set these two ways:
+
+**Via Cargo features** — enable a feature named `<setting>-<value>` (use dashes, not underscores):
+
+```toml
+[dependencies]
+smoltcp = { version = "0.13.0", default-features = false, features = [
+    "proto-ipv4", "socket-tcp", "medium-ethernet",
+    "iface-max-addr-count-4",          # allow 4 IP addresses per interface
+    "iface-neighbor-cache-count-16",   # 16-entry ARP cache
+    "reassembly-buffer-size-4096",     # 4 KB reassembly buffer
+] }
+```
+
+**Via environment variables** — set `SMOLTCP_<SETTING>=<value>` at build time:
+
+```bash
+SMOLTCP_IFACE_MAX_ADDR_COUNT=4 cargo build
+```
+
+Environment variables take precedence over Cargo features. If two features conflict (e.g. both `iface-max-addr-count-2` and `iface-max-addr-count-4` enabled), the build fails.
+
+Key configuration knobs and their defaults:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `IFACE_MAX_ADDR_COUNT` | 2 | IP addresses assignable per interface (IPv4 + IPv6 combined). |
+| `IFACE_MAX_MULTICAST_GROUP_COUNT` | 4 | Multicast groups joinable per interface. |
+| `IFACE_NEIGHBOR_CACHE_COUNT` | 8 | ARP / neighbor cache entries per interface. |
+| `IFACE_MAX_ROUTE_COUNT` | 2 | Routes per interface, including the default route. |
+| `FRAGMENTATION_BUFFER_SIZE` | 1500 | Bytes available for outgoing packet fragmentation. Packets larger than this are dropped. |
+| `REASSEMBLY_BUFFER_SIZE` | 1500 | Bytes available for incoming packet reassembly. |
+| `REASSEMBLY_BUFFER_COUNT` | 1 | Concurrent reassembly sessions. |
+| `DNS_MAX_RESULT_COUNT` | 1 | Address records kept per DNS query result. |
+| `DNS_MAX_SERVER_COUNT` | 1 | DNS servers configurable per DNS socket. |
+| `DNS_MAX_NAME_SIZE` | 255 | Maximum DNS name length in bytes. |

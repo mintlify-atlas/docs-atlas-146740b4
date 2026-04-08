@@ -1,0 +1,406 @@
+---
+title: "TCP server and client"
+description: "Building TCP server and client applications with smoltcp."
+---
+
+This page walks through four examples that demonstrate TCP communication with smoltcp: a multi-port server, a connecting client, a bare-metal loopback example, and an HTTP client.
+
+All tap-based examples require a `tap0` interface. See the [hosted Linux guide](/guides/hosted-linux) for setup instructions.
+
+## server.rs
+
+`server.rs` emulates a network host that responds to basic requests. It assigns itself hardware address `02-00-00-00-00-01` and IPv4 address `192.168.69.1`, then listens on four TCP ports and one UDP port simultaneously.
+
+**Required features:**
+```toml
+required-features = ["std", "medium-ethernet", "medium-ip", "phy-tuntap_interface", "proto-ipv4", "socket-tcp", "socket-udp"]
+```
+
+### What each port does
+
+| Port | Protocol | Behavior |
+|------|----------|----------|
+| 6969 | UDP | Reverses and echoes each received packet back to the sender |
+| 6969 | TCP | Sends `"hello\n"` to any connecting client, then closes the connection |
+| 6970 | TCP | Echoes received data back in reversed chunks indefinitely |
+| 6971 | TCP | Sinks all incoming data; keep-alive every 1 s, user timeout at 2 s |
+| 6972 | TCP | Sources a continuous stream of incrementing bytes |
+
+<Note>
+  Except for port 6971, socket buffers are only 64 bytes long. This makes it easy to observe resource exhaustion when testing.
+</Note>
+
+### Socket creation
+
+The server creates one UDP socket and four TCP sockets, adds them all to a `SocketSet`, then polls them in a loop:
+
+```rust
+// UDP socket with 65535-byte buffers
+let udp_rx_buffer = udp::PacketBuffer::new(
+    vec![udp::PacketMetadata::EMPTY, udp::PacketMetadata::EMPTY],
+    vec![0; 65535],
+);
+let udp_tx_buffer = udp::PacketBuffer::new(
+    vec![udp::PacketMetadata::EMPTY, udp::PacketMetadata::EMPTY],
+    vec![0; 65535],
+);
+let udp_socket = udp::Socket::new(udp_rx_buffer, udp_tx_buffer);
+
+// TCP socket with 64-byte buffers (port 6969)
+let tcp1_rx_buffer = tcp::SocketBuffer::new(vec![0; 64]);
+let tcp1_tx_buffer = tcp::SocketBuffer::new(vec![0; 128]);
+let tcp1_socket = tcp::Socket::new(tcp1_rx_buffer, tcp1_tx_buffer);
+
+let mut sockets = SocketSet::new(vec![]);
+let udp_handle = sockets.add(udp_socket);
+let tcp1_handle = sockets.add(tcp1_socket);
+// ... add tcp2, tcp3, tcp4 similarly
+```
+
+### Listen and send/recv loop
+
+Each socket is bound or set to listen on first access, and the poll loop handles each socket's state in sequence:
+
+```rust
+loop {
+    let timestamp = Instant::now();
+    iface.poll(timestamp, &mut device, &mut sockets);
+
+    // udp:6969 — receive, reverse, and reply
+    let socket = sockets.get_mut::<udp::Socket>(udp_handle);
+    if !socket.is_open() {
+        socket.bind(6969).unwrap()
+    }
+    let client = match socket.recv() {
+        Ok((data, endpoint)) => {
+            let mut data = data.to_vec();
+            data.reverse();
+            Some((endpoint, data))
+        }
+        Err(_) => None,
+    };
+    if let Some((endpoint, data)) = client {
+        socket.send_slice(&data, endpoint).unwrap();
+    }
+
+    // tcp:6969 — greet and close
+    let socket = sockets.get_mut::<tcp::Socket>(tcp1_handle);
+    if !socket.is_open() {
+        socket.listen(6969).unwrap();
+    }
+    if socket.can_send() {
+        writeln!(socket, "hello").unwrap();
+        socket.close();
+    }
+
+    // tcp:6971 — sinkhole with keep-alive and timeout
+    let socket = sockets.get_mut::<tcp::Socket>(tcp3_handle);
+    if !socket.is_open() {
+        socket.listen(6971).unwrap();
+        socket.set_keep_alive(Some(Duration::from_millis(1000)));
+        socket.set_timeout(Some(Duration::from_millis(2000)));
+    }
+
+    phy_wait(fd, iface.poll_delay(timestamp, &sockets)).expect("wait error");
+}
+```
+
+### Running the server
+
+<Steps>
+  <Step title="Start the server">
+    ```bash
+    cargo run --example server -- --tap tap0
+    ```
+    The server starts and immediately begins listening on all five ports.
+  </Step>
+  <Step title="Test with socat">
+    In a separate terminal, connect to one of the TCP ports:
+    ```bash
+    # TCP port 6969 — receives "hello" and disconnects
+    socat stdio tcp4-connect:192.168.69.1:6969
+
+    # TCP port 6970 — echo with reversal
+    socat stdio tcp4-connect:192.168.69.1:6970 <<< "abcdefg"
+
+    # UDP port 6969 — sends reversed reply
+    socat stdio udp4-connect:192.168.69.1:6969 <<< "abcdefg"
+    ```
+  </Step>
+  <Step title="Test fault tolerance (optional)">
+    Inject 15% packet loss to observe retransmissions:
+    ```bash
+    cargo run --example server -- --tap tap0 --drop-chance 15
+    ```
+  </Step>
+</Steps>
+
+---
+
+## client.rs
+
+`client.rs` emulates a network host that connects to a TCP server at a given address and port. It assigns itself hardware address `02-00-00-00-00-02` and IPv4 address `192.168.69.2`. Once connected, it reads data from the server, reverses each line, and sends it back.
+
+**Required features:**
+```toml
+required-features = ["std", "medium-ethernet", "medium-ip", "phy-tuntap_interface", "proto-ipv4", "socket-tcp", "socket-udp"]
+```
+
+### Socket creation and connect
+
+```rust
+// Create a TCP socket with 1500-byte buffers
+let tcp_rx_buffer = tcp::SocketBuffer::new(vec![0; 1500]);
+let tcp_tx_buffer = tcp::SocketBuffer::new(vec![0; 1500]);
+let tcp_socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);
+let mut sockets = SocketSet::new(vec![]);
+let tcp_handle = sockets.add(tcp_socket);
+
+// Connect immediately before entering the poll loop
+let socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
+socket
+    .connect(iface.context(), (address, port), 49500)
+    .unwrap();
+```
+
+### Receive and echo loop
+
+```rust
+let mut tcp_active = false;
+loop {
+    let timestamp = Instant::now();
+    iface.poll(timestamp, &mut device, &mut sockets);
+
+    let socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
+    if socket.is_active() && !tcp_active {
+        debug!("connected");
+    } else if !socket.is_active() && tcp_active {
+        debug!("disconnected");
+        break;
+    }
+    tcp_active = socket.is_active();
+
+    if socket.may_recv() {
+        let data = socket
+            .recv(|data| {
+                let mut data = data.to_owned();
+                if !data.is_empty() {
+                    data = data.split(|&b| b == b'\n').collect::<Vec<_>>().concat();
+                    data.reverse();
+                    data.extend(b"\n");
+                }
+                (data.len(), data)
+            })
+            .unwrap();
+        if socket.can_send() && !data.is_empty() {
+            socket.send_slice(&data[..]).unwrap();
+        }
+    } else if socket.may_send() {
+        socket.close();
+    }
+
+    phy_wait(fd, iface.poll_delay(timestamp, &sockets)).expect("wait error");
+}
+```
+
+### Running the client
+
+<Steps>
+  <Step title="Start a listener">
+    Open a TCP listener in a separate terminal:
+    ```bash
+    socat stdio tcp4-listen:1234
+    ```
+  </Step>
+  <Step title="Run the client">
+    ```bash
+    cargo run --example client -- --tap tap0 192.168.69.100 1234
+    ```
+    The client connects, then echoes any data you type (reversed) back to the listener.
+  </Step>
+</Steps>
+
+---
+
+## loopback.rs
+
+`loopback.rs` is a bare-metal example that requires no OS networking support. It uses smoltcp's `Loopback` device to connect a TCP client socket to a TCP server socket within the same process, over the loopback address `127.0.0.1`.
+
+**Required features (without std):**
+```toml
+required-features = ["log", "medium-ethernet", "proto-ipv4", "socket-tcp", "alloc"]
+```
+
+### Static buffer allocation
+
+On embedded targets, stack or heap allocation for socket buffers is risky. The example shows how to use `static mut` buffers to place data in a known memory region at compile time:
+
+```rust
+let server_socket = {
+    static mut TCP_SERVER_RX_DATA: [u8; 1024] = [0; 1024];
+    static mut TCP_SERVER_TX_DATA: [u8; 1024] = [0; 1024];
+    let tcp_rx_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_SERVER_RX_DATA[..] });
+    let tcp_tx_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_SERVER_TX_DATA[..] });
+    tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer)
+};
+
+let client_socket = {
+    static mut TCP_CLIENT_RX_DATA: [u8; 1024] = [0; 1024];
+    static mut TCP_CLIENT_TX_DATA: [u8; 1024] = [0; 1024];
+    let tcp_rx_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_CLIENT_RX_DATA[..] });
+    let tcp_tx_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_CLIENT_TX_DATA[..] });
+    tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer)
+};
+```
+
+### Poll loop with simulated clock
+
+Without `std`, a monotonic clock is unavailable. The example uses a mock clock that advances manually based on `poll_delay`:
+
+```rust
+while !done && clock.elapsed() < Instant::from_millis(10_000) {
+    iface.poll(clock.elapsed(), &mut device, &mut sockets);
+
+    let mut socket = sockets.get_mut::<tcp::Socket>(server_handle);
+    if !socket.is_active() && !socket.is_listening() {
+        if !did_listen {
+            socket.listen(1234).unwrap();
+            did_listen = true;
+        }
+    }
+    if socket.can_recv() {
+        socket.recv(|buffer| { (buffer.len(), str::from_utf8(buffer).unwrap()) });
+        socket.close();
+        done = true;
+    }
+
+    let mut socket = sockets.get_mut::<tcp::Socket>(client_handle);
+    let cx = iface.context();
+    if !socket.is_open() {
+        if !did_connect {
+            socket.connect(cx, (IpAddress::v4(127, 0, 0, 1), 1234), 65000).unwrap();
+            did_connect = true;
+        }
+    }
+    if socket.can_send() {
+        socket.send_slice(b"0123456789abcdef").unwrap();
+        socket.close();
+    }
+
+    match iface.poll_delay(clock.elapsed(), &sockets) {
+        Some(Duration::ZERO) => {}
+        Some(delay) => clock.advance(delay),
+        None => clock.advance(Duration::from_millis(1)),
+    }
+}
+```
+
+### Running loopback.rs
+
+<Steps>
+  <Step title="Run without std (bare-metal simulation)">
+    ```bash
+    cargo run --example loopback --no-default-features \
+      --features="log proto-ipv4 socket-tcp alloc"
+    ```
+    No output appears without `std`; the stack runs silently.
+  </Step>
+  <Step title="Run with std and capture a pcap">
+    ```bash
+    cargo run --example loopback -- --pcap loopback.pcap
+    ```
+    Open `loopback.pcap` in Wireshark to inspect the full TCP handshake and data exchange between the two in-process sockets.
+  </Step>
+</Steps>
+
+---
+
+## httpclient.rs
+
+`httpclient.rs` demonstrates an HTTP GET client over TCP. It assigns itself hardware address `02-00-00-00-00-01`, IPv4 address `192.168.69.1`, and IPv6 address `fdaa::1`. You supply a raw IP address (not a hostname) and a URL; the example connects on port 80 (or the port from the URL), sends an HTTP/1.1 GET request, and prints the response.
+
+**Required features:**
+```toml
+required-features = ["std", "medium-ethernet", "medium-ip", "phy-tuntap_interface", "proto-ipv4", "proto-ipv6", "socket-tcp"]
+```
+
+<Note>
+  TCP socket buffers are limited to 1024 bytes to produce more interesting packet traces.
+</Note>
+
+### State machine
+
+The example uses an explicit three-state enum to sequence the HTTP exchange:
+
+```rust
+enum State {
+    Connect,
+    Request,
+    Response,
+}
+let mut state = State::Connect;
+
+loop {
+    let timestamp = Instant::now();
+    iface.poll(timestamp, &mut device, &mut sockets);
+
+    let socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
+    let cx = iface.context();
+
+    state = match state {
+        State::Connect if !socket.is_active() => {
+            let local_port = 49152 + rand::random::<u16>() % 16384;
+            socket
+                .connect(cx, (address, url.port().unwrap_or(80)), local_port)
+                .unwrap();
+            State::Request
+        }
+        State::Request if socket.may_send() => {
+            let http_get = "GET ".to_owned() + url.path() + " HTTP/1.1\r\n";
+            socket.send_slice(http_get.as_ref()).expect("cannot send");
+            let http_host = "Host: ".to_owned() + url.host_str().unwrap() + "\r\n";
+            socket.send_slice(http_host.as_ref()).expect("cannot send");
+            socket.send_slice(b"Connection: close\r\n").expect("cannot send");
+            socket.send_slice(b"\r\n").expect("cannot send");
+            State::Response
+        }
+        State::Response if socket.can_recv() => {
+            socket.recv(|data| {
+                println!("{}", str::from_utf8(data).unwrap_or("(invalid utf8)"));
+                (data.len(), ())
+            }).unwrap();
+            State::Response
+        }
+        State::Response if !socket.may_recv() => break,
+        _ => state,
+    };
+
+    phy_wait(fd, iface.poll_delay(timestamp, &sockets)).expect("wait error");
+}
+```
+
+### Running httpclient.rs
+
+<Steps>
+  <Step title="Enable internet routing on tap0">
+    The HTTP client needs to reach an external server. Set up masquerading as described in the [hosted Linux guide](/guides/hosted-linux):
+    ```bash
+    sudo iptables -t nat -A POSTROUTING -s 192.168.69.0/24 -j MASQUERADE
+    sudo sysctl net.ipv4.ip_forward=1
+    ```
+  </Step>
+  <Step title="Run an IPv4 request">
+    Pass the server's raw IP address, not its hostname:
+    ```bash
+    cargo run --example httpclient -- --tap tap0 93.184.216.34 http://example.org/
+    ```
+  </Step>
+  <Step title="Run an IPv6 request">
+    ```bash
+    cargo run --example httpclient -- --tap tap0 \
+      2606:2800:220:1:248:1893:25c8:1946 http://example.org/
+    ```
+  </Step>
+</Steps>
+
+The example prints all response data received from the server, then exits when the connection closes.

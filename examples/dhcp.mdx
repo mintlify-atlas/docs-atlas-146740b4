@@ -1,0 +1,157 @@
+---
+title: "DHCP client"
+description: "Using the DHCPv4 socket to obtain an IP address dynamically."
+---
+
+`dhcp_client.rs` demonstrates smoltcp's DHCPv4 socket. It starts with no IP address configured, sends a DHCP DISCOVER, and applies whatever address, default gateway, and DNS servers the server offers. It also handles lease renewal and deconfiguration events.
+
+## Prerequisites
+
+### Required features
+
+```toml
+required-features = ["std", "medium-ethernet", "medium-ip", "phy-tuntap_interface",
+                     "proto-ipv4", "proto-dhcpv4", "socket-raw"]
+```
+
+The `socket-dhcpv4` feature enables `smoltcp::socket::dhcpv4`. It implicitly requires `medium-ethernet` and `proto-dhcpv4`.
+
+### Bridged connection required
+
+DHCP relies on broadcast packets reaching a real DHCP server. A routed TAP interface intercepts broadcast traffic before it can reach the LAN, so you must use a **bridged** connection instead.
+
+<Warning>
+  The bridged setup only works over wired Ethernet. It does **not** work on Wi-Fi connections.
+</Warning>
+
+Set up the bridge before running the example. Replace `enp0s20f0u1u1` with your wired interface name:
+
+```bash
+ETH=enp0s20f0u1u1
+
+sudo modprobe bridge
+sudo modprobe br_netfilter
+
+sudo sysctl -w net.bridge.bridge-nf-call-arptables=0
+sudo sysctl -w net.bridge.bridge-nf-call-ip6tables=0
+sudo sysctl -w net.bridge.bridge-nf-call-iptables=0
+
+sudo ip tuntap add name tap0 mode tap user $USER
+sudo brctl addbr br0
+sudo brctl addif br0 tap0
+sudo brctl addif br0 $ETH
+sudo ip link set tap0 up
+sudo ip link set $ETH up
+sudo ip link set br0 up
+
+sudo dhcpcd br0
+```
+
+See the [hosted Linux guide](/guides/hosted-linux) for the full teardown procedure.
+
+<Note>
+  The IP address configuration in the example must match your LAN's subnet when running with a bridged connection.
+</Note>
+
+## How the DHCPv4 socket works
+
+The `dhcpv4::Socket` drives the DHCP state machine internally. You create it, add it to the socket set, and call `.poll()` on it each time through your main loop. The socket returns `None` when there is nothing to act on, or one of two events when the DHCP state changes:
+
+| Event | Meaning |
+|---|---|
+| `dhcpv4::Event::Configured(config)` | A lease was acquired or renewed. Apply the address, gateway, and DNS servers from `config`. |
+| `dhcpv4::Event::Deconfigured` | The lease expired or was lost. Remove the IP address and default route. |
+
+## Socket creation
+
+```rust
+use smoltcp::socket::dhcpv4;
+
+// dhcpv4::Socket::new() takes no arguments — the socket manages
+// its own internal DHCP packet buffers.
+let mut dhcp_socket = dhcpv4::Socket::new();
+
+// Optional: shorten the maximum lease duration to force rapid renewal.
+// Remove this in production.
+dhcp_socket.set_max_lease_duration(Some(Duration::from_secs(10)));
+
+let mut sockets = SocketSet::new(vec![]);
+let dhcp_handle = sockets.add(dhcp_socket);
+```
+
+## Poll and event loop
+
+```rust
+loop {
+    let timestamp = Instant::now();
+    iface.poll(timestamp, &mut device, &mut sockets);
+
+    let event = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll();
+    match event {
+        None => {}
+        Some(dhcpv4::Event::Configured(config)) => {
+            debug!("DHCP config acquired!");
+            debug!("IP address:      {}", config.address);
+            set_ipv4_addr(&mut iface, config.address);
+
+            if let Some(router) = config.router {
+                debug!("Default gateway: {}", router);
+                iface.routes_mut().add_default_ipv4_route(router).unwrap();
+            } else {
+                iface.routes_mut().remove_default_ipv4_route();
+            }
+
+            for (i, s) in config.dns_servers.iter().enumerate() {
+                debug!("DNS server {}:    {}", i, s);
+            }
+        }
+        Some(dhcpv4::Event::Deconfigured) => {
+            debug!("DHCP lost config!");
+            iface.update_ip_addrs(|addrs| addrs.clear());
+            iface.routes_mut().remove_default_ipv4_route();
+        }
+    }
+
+    phy_wait(fd, iface.poll_delay(timestamp, &sockets)).expect("wait error");
+}
+```
+
+Applying the address from a `Configured` event uses a helper that clears any previous address before setting the new one:
+
+```rust
+fn set_ipv4_addr(iface: &mut Interface, cidr: Ipv4Cidr) {
+    iface.update_ip_addrs(|addrs| {
+        addrs.clear();
+        addrs.push(IpCidr::Ipv4(cidr)).unwrap();
+    });
+}
+```
+
+## Running the example
+
+<Steps>
+  <Step title="Set up the bridge">
+    Follow the bridged connection setup above to connect `tap0` to your wired Ethernet interface.
+  </Step>
+  <Step title="Run the DHCP client">
+    ```bash
+    cargo run --example dhcp_client -- --tap tap0
+    ```
+  </Step>
+  <Step title="Observe the output">
+    With `RUST_LOG=debug` set, you will see lines similar to:
+
+    ```
+    [0ms] (socket::dhcpv4): DHCP config acquired!
+    [0ms] (socket::dhcpv4): IP address:      192.168.1.42/24
+    [0ms] (socket::dhcpv4): Default gateway: 192.168.1.1
+    [0ms] (socket::dhcpv4): DNS server 0:    192.168.1.1
+    ```
+
+    Because the example sets `max_lease_duration` to 10 seconds, you will also see renewal attempts and a `Deconfigured` event when the short lease expires. Remove the `set_max_lease_duration` call in your own code to use the server's advertised lease time.
+  </Step>
+</Steps>
+
+<Tip>
+  Use `--pcap dhcp.pcap` to capture the DISCOVER → OFFER → REQUEST → ACK exchange and open it in Wireshark to inspect the full DHCP negotiation.
+</Tip>

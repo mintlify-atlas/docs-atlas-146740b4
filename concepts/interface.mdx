@@ -1,0 +1,202 @@
+---
+title: "Network interface"
+description: "Configuring and polling a smoltcp Interface to drive the protocol stack."
+---
+
+`Interface` is the central coordinator of the smoltcp stack. It owns the IP address table, routing table, and neighbor cache (ARP/NDISC), and it drives all protocol work on every call to `poll()`. Your application interacts with it by registering sockets in a `SocketSet` and then calling `poll()` in a loop.
+
+## Setting up an interface
+
+<Steps>
+  <Step title="Build a Config">
+    `Config` holds the hardware address for the interface and a random seed. The seed is used to initialize sequence numbers and port selection — use a different value on each boot to avoid TCP collisions after a reset:
+
+    ```rust
+    use smoltcp::iface::Config;
+    use smoltcp::wire::{EthernetAddress, HardwareAddress};
+
+    let mac = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    let mut config = Config::new(HardwareAddress::Ethernet(mac));
+    config.random_seed = get_random_u64(); // use your entropy source
+    ```
+
+    For an IP-only medium (Linux `tun`, PPP), pass `HardwareAddress::Ip` instead of an Ethernet address. For IEEE 802.15.4, pass `HardwareAddress::Ieee802154(...)` and optionally set `config.pan_id`.
+  </Step>
+  <Step title="Create the Interface">
+    Pass the config, a mutable reference to your device, and the current `Instant` timestamp. The constructor reads `device.capabilities()` and asserts that the hardware address medium matches the device medium:
+
+    ```rust
+    use smoltcp::iface::Interface;
+    use smoltcp::time::Instant;
+
+    let now = Instant::from_millis(0); // your monotonic clock
+    let mut iface = Interface::new(config, &mut device, now);
+    ```
+
+    <Note>
+    The `Instant` type represents a monotonically increasing millisecond counter since an arbitrary epoch (for example, system startup). smoltcp does not call any system clock functions — you always supply the current time explicitly.
+    </Note>
+  </Step>
+  <Step title="Assign IP addresses">
+    Use `update_ip_addrs()` to set one or more IP addresses in CIDR notation. The closure receives a `heapless::Vec` with capacity `IFACE_MAX_ADDR_COUNT` (configurable at build time, defaults to 2):
+
+    ```rust
+    use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+
+    iface.update_ip_addrs(|addrs| {
+        addrs.push(IpCidr::new(
+            IpAddress::v4(192, 168, 1, 100),
+            24,
+        )).unwrap();
+    });
+    ```
+
+    Calling `update_ip_addrs()` also flushes the neighbor cache, which is correct behaviour when the network configuration changes.
+  </Step>
+  <Step title="Add routes">
+    Call `iface.routes_mut()` to get a mutable reference to the `Routes` table, then add default gateways or specific prefixes:
+
+    ```rust
+    use smoltcp::wire::Ipv4Address;
+
+    iface.routes_mut()
+        .add_default_ipv4_route(Ipv4Address::new(192, 168, 1, 1))
+        .unwrap();
+    ```
+
+    For IPv6:
+
+    ```rust
+    use smoltcp::wire::Ipv6Address;
+
+    // Replace with your actual IPv6 gateway address
+    iface.routes_mut()
+        .add_default_ipv6_route(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))
+        .unwrap();
+    ```
+
+    For arbitrary prefixes, use `routes_mut().update(|table| { table.push(route).unwrap(); })`.
+  </Step>
+  <Step title="Create a SocketSet and register sockets">
+    ```rust
+    use smoltcp::iface::{SocketSet, SocketStorage};
+    use smoltcp::socket::tcp;
+
+    let mut socket_storage = [SocketStorage::EMPTY; 4];
+    let mut sockets = SocketSet::new(&mut socket_storage[..]);
+
+    let tcp_rx = tcp::SocketBuffer::new(vec![0u8; 4096]);
+    let tcp_tx = tcp::SocketBuffer::new(vec![0u8; 4096]);
+    let tcp_handle = sockets.add(tcp::Socket::new(tcp_rx, tcp_tx));
+    ```
+  </Step>
+  <Step title="Run the poll loop">
+    Call `iface.poll()` whenever a packet might have arrived or a timer might have fired. It processes all pending ingress frames and drains socket TX buffers:
+
+    ```rust
+    loop {
+        let now = Instant::from_millis(millis_since_boot());
+        iface.poll(now, &mut device, &mut sockets);
+
+        // Read from / write to sockets here.
+
+        // Sleep until the next deadline to save power.
+        if let Some(delay) = iface.poll_delay(now, &sockets) {
+            sleep(delay);
+        }
+    }
+    ```
+  </Step>
+</Steps>
+
+## The poll loop in detail
+
+`Interface::poll()` does three things on each call:
+
+1. **Maintenance** — expires stale reassembly buffers, syncs SLAAC state if IPv6 stateless address autoconfiguration is enabled.
+2. **Ingress** — calls `device.receive()` in a loop until no packets remain. Each received frame is parsed, matched to a socket, and its payload is placed in the socket's RX buffer. ARP and NDISC control traffic is handled in-band without matching any socket.
+3. **Egress** — iterates every socket and calls its `dispatch()` to flush any pending TX data. Each outgoing packet resolves a destination hardware address (via the neighbor cache or a fresh ARP/NDISC probe), then calls `device.transmit()`.
+
+`poll()` returns a `PollResult`:
+
+| Value | Meaning |
+|---|---|
+| `PollResult::None` | No socket state changed. |
+| `PollResult::SocketStateChanged` | At least one socket may have data to read or capacity to write. Check your sockets. |
+
+<Note>
+`poll()` processes all queued ingress packets in one call. If your environment does not have preemptive scheduling and ingress can arrive faster than you process it, use the lower-level `poll_ingress_single()` instead, which processes exactly one packet and is guaranteed to do a bounded amount of work.
+</Note>
+
+## Determining when to call poll
+
+`poll_at()` returns the next `Instant` at which you must call `poll()`, or `None` if no timer is pending (only new ingress can trigger work):
+
+```rust
+let next = iface.poll_at(now, &sockets);
+```
+
+`poll_delay()` returns the same information as a `Duration` relative to `now`, which is more convenient when feeding a `select()` or `epoll()` timeout:
+
+```rust
+if let Some(delay) = iface.poll_delay(now, &sockets) {
+    // Wait at most `delay` before calling poll() again.
+    thread::sleep(delay.into());
+}
+```
+
+Both methods aggregate across all sockets: if any socket needs service immediately, the result is `Instant::from_millis(0)` / `Duration::ZERO`.
+
+## IP address management
+
+| Method | Effect |
+|---|---|
+| `iface.update_ip_addrs(f)` | Mutate the IP address list. Flushes the neighbor cache. Panics if any address is not unicast. |
+| `iface.ip_addrs()` | Read the current IP address list as `&[IpCidr]`. |
+| `iface.ipv4_addr()` | Convenience accessor for the first assigned IPv4 address. |
+| `iface.ipv6_addr()` | Convenience accessor for the first assigned IPv6 address. |
+| `iface.has_ip_addr(addr)` | Returns `true` if the address is assigned to the interface. |
+
+## Routing
+
+The `Routes` table stores a fixed-size list of `Route` entries, each mapping a CIDR prefix to a next-hop router address with optional expiry timestamps:
+
+```rust
+pub struct Route {
+    pub cidr: IpCidr,
+    pub via_router: IpAddress,
+    pub preferred_until: Option<Instant>, // None means forever
+    pub expires_at: Option<Instant>,      // None means forever
+}
+```
+
+Lookup selects the most specific matching route (longest prefix). When multiple routes match, the one with the highest `prefix_len` wins.
+
+```rust
+// Add a host route that expires in 300 seconds.
+iface.routes_mut().update(|table| {
+    table.push(Route {
+        cidr: IpCidr::new(IpAddress::v4(10, 0, 0, 1), 32),
+        via_router: IpAddress::v4(192, 168, 1, 1),
+        preferred_until: Some(now + Duration::from_secs(300)),
+        expires_at: Some(now + Duration::from_secs(300)),
+    }).unwrap();
+});
+```
+
+The table capacity is set by the `IFACE_MAX_ROUTE_COUNT` config constant (default 2). Adding a route when the table is full returns `Err(RouteTableFull)`.
+
+## AnyIP mode
+
+When `iface.set_any_ip(true)` is set, the interface accepts packets destined to any address covered by a route prefix whose gateway is one of the interface's own IP addresses. This is useful when smoltcp is acting as a router or when a single interface needs to respond on behalf of multiple virtual addresses.
+
+## Async support
+
+When the `async` Cargo feature is enabled, sockets expose waker registration methods (`register_send_waker`, `register_recv_waker`). smoltcp calls the registered wakers from within `poll()` whenever a socket's state changes, letting your async executor wake the appropriate task without polling continuously.
+
+```toml
+[dependencies]
+smoltcp = { version = "...", features = ["async", "socket-tcp"] }
+```
+
+Use `socket.recv()` and `socket.send()` as normal — the async integration only affects when your task is woken, not the socket API itself.

@@ -1,0 +1,202 @@
+---
+title: "TCP"
+description: "TCP socket API and protocol behavior in smoltcp."
+---
+
+smoltcp implements a full TCP stack over both IPv4 and IPv6. TCP sockets can operate as servers
+(listening for incoming connections) or clients (initiating outgoing connections).
+
+## Supported features
+
+- Full RFC 793 state machine: CLOSED, LISTEN, SYN-SENT, SYN-RECEIVED, ESTABLISHED, FIN-WAIT-1,
+  FIN-WAIT-2, CLOSE-WAIT, CLOSING, LAST-ACK, TIME-WAIT
+- Header checksum generation and validation
+- Maximum Segment Size (MSS) negotiation
+- Window scaling (RFC 7323)
+- Multiple in-flight packets without waiting for acknowledgement
+- Out-of-order segment reassembly (up to 4 or 32 gaps via `ASSEMBLER_MAX_SEGMENT_COUNT`)
+- Keep-alive packets at a configurable interval
+- Retransmission timeout starting at an RTT estimate, doubling on each retry (RFC 6298)
+- Time-wait timeout fixed at 10 seconds
+- Configurable user timeout
+- Delayed acknowledgements with configurable delay (default: 10 ms)
+- Nagle's algorithm
+- Zero window probing
+
+<Note>
+The following features are not implemented: selective acknowledgements (SACK), silly window
+syndrome avoidance, timestamping, and the urgent pointer (it is silently ignored).
+PLPMTU discovery (RFC 4821) is also not implemented.
+</Note>
+
+## Congestion control
+
+smoltcp supports two congestion control algorithms, selectable per socket. CUBIC is the default
+when enabled.
+
+| Feature | Algorithm | Notes |
+|---|---|---|
+| `socket-tcp-cubic` | CUBIC | Default when enabled. Uses `f64` floating-point — may be costly on cores without an FPU (e.g., Cortex-M0/M1/M3). |
+| `socket-tcp-reno` | Reno | Integer-only. Preferred for FPU-less targets, interrupt handlers, or kernel-mode code. |
+
+```toml
+[dependencies]
+smoltcp = { version = "0.13.0", features = [
+    "socket-tcp",
+    "socket-tcp-reno",   # use Reno if no FPU
+] }
+```
+
+You can select the algorithm when creating a socket:
+
+```rust
+use smoltcp::socket::tcp::{Socket, CongestionControl};
+
+let mut socket = Socket::new(rx_buffer, tx_buffer);
+socket.set_congestion_control(CongestionControl::Reno);
+```
+
+## Creating a socket
+
+A TCP socket requires two ring buffers: one for incoming data and one for outgoing data.
+`tcp::SocketBuffer` is a type alias for `RingBuffer<u8>`.
+
+```rust
+use smoltcp::socket::tcp;
+
+let rx_buffer = tcp::SocketBuffer::new(vec![0u8; 4096]);
+let tx_buffer = tcp::SocketBuffer::new(vec![0u8; 4096]);
+let socket = tcp::Socket::new(rx_buffer, tx_buffer);
+
+let socket_handle = socket_set.add(socket);
+```
+
+Buffer sizes directly affect throughput. Larger buffers allow more data in flight and reduce
+the frequency of stalls while waiting for acknowledgements.
+
+## Server and client patterns
+
+<Tabs>
+  <Tab title="Server (listening)">
+    A server socket listens on a port and accepts the first incoming connection. Because
+    there is no backlog, you need one socket per simultaneous connection.
+
+    ```rust
+    use smoltcp::socket::tcp;
+    use smoltcp::wire::IpListenEndpoint;
+
+    let socket = socket_set.get_mut::<tcp::Socket>(socket_handle);
+
+    if !socket.is_open() {
+        // Listen on port 80, any IP address
+        socket.listen(80).unwrap();
+    }
+
+    if socket.can_recv() {
+        socket.recv_slice(&mut buf).unwrap();
+    }
+
+    if socket.can_send() {
+        socket.send_slice(b"HTTP/1.0 200 OK\r\n\r\n").unwrap();
+        socket.close();
+    }
+    ```
+
+    The socket transitions from LISTEN to ESTABLISHED when a client connects. After calling
+    `close()`, it performs the standard FIN handshake and returns to CLOSED, where you can
+    call `listen()` again for the next connection.
+  </Tab>
+
+  <Tab title="Client (connecting)">
+    A client socket initiates a connection to a remote endpoint. You supply both the remote
+    address/port and the local port.
+
+    ```rust
+    use smoltcp::socket::tcp;
+    use smoltcp::wire::{IpAddress, IpEndpoint};
+
+    let socket = socket_set.get_mut::<tcp::Socket>(socket_handle);
+
+    if !socket.is_open() {
+        let remote = IpEndpoint::new(IpAddress::v4(93, 184, 216, 34), 80);
+        // cx is the interface context passed into the poll callback
+        socket.connect(cx, remote, 49152).unwrap();
+    }
+
+    if socket.may_send() {
+        socket.send_slice(b"GET / HTTP/1.0\r\n\r\n").unwrap();
+    }
+
+    if socket.can_recv() {
+        let n = socket.recv_slice(&mut buf).unwrap();
+        // process buf[..n]
+    }
+    ```
+
+    `connect` returns immediately; the three-way handshake completes asynchronously. Poll the
+    interface in a loop and check `socket.state()` or `socket.may_send()` to detect when the
+    connection is established.
+  </Tab>
+</Tabs>
+
+## Send and receive
+
+| Method | Description |
+|---|---|
+| `socket.send_slice(data)` | Copies data into the transmit buffer. Returns the number of bytes written, or `SendError::InvalidState` if the socket is not open for writing. |
+| `socket.recv_slice(buf)` | Copies received data out of the receive buffer. Returns the number of bytes read, or `RecvError::InvalidState` / `RecvError::Finished`. |
+| `socket.can_send()` | Returns `true` if there is space in the transmit buffer. |
+| `socket.can_recv()` | Returns `true` if there is data in the receive buffer. |
+
+## Keep-alive
+
+Keep-alive probes detect dead connections. When enabled, smoltcp sends a probe packet after
+the configured interval of inactivity. If the remote does not respond within the user timeout,
+the connection is aborted.
+
+```rust
+use smoltcp::time::Duration;
+
+let socket = socket_set.get_mut::<tcp::Socket>(socket_handle);
+
+// Send a keep-alive probe every 75 seconds
+socket.set_keep_alive(Some(Duration::from_secs(75)));
+
+// Abort the connection if no response within 120 seconds
+socket.set_timeout(Some(Duration::from_secs(120)));
+```
+
+Pass `None` to either method to disable that feature.
+
+## Delayed ACKs
+
+Delayed acknowledgements are enabled by default with a 10 ms delay. You can adjust or disable
+the delay:
+
+```rust
+use smoltcp::time::Duration;
+
+// Set a custom delay
+socket.set_ack_delay(Some(Duration::from_millis(20)));
+
+// Disable delayed ACKs (send ACKs immediately)
+socket.set_ack_delay(None);
+```
+
+## SYN-ACK pause
+
+The `socket-tcp-pause-synack` feature lets you delay the SYN-ACK response on a listening
+socket. This is useful in scenarios where you need to perform some work (such as allocating
+resources) before accepting the connection.
+
+```toml
+smoltcp = { version = "0.13.0", features = ["socket-tcp-pause-synack"] }
+```
+
+```rust
+// Pause SYN-ACK: smoltcp will not complete the handshake until you unpause
+socket.set_synack_paused(true);
+
+// Allow the handshake to complete
+socket.set_synack_paused(false);
+```

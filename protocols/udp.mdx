@@ -1,0 +1,126 @@
+---
+title: "UDP"
+description: "UDP socket API in smoltcp."
+---
+
+smoltcp supports UDP over both IPv4 and IPv6. UDP sockets send and receive individual datagrams,
+each carrying its own source and destination endpoint.
+
+## Feature flag
+
+```toml
+[dependencies]
+smoltcp = { version = "0.13.0", default-features = false, features = [
+    "proto-ipv4", # or proto-ipv6
+    "socket-udp",
+] }
+```
+
+## Protocol behavior
+
+- UDP header checksum is always generated for outgoing packets and validated on incoming packets.
+- If a packet arrives on a port with no listening socket, smoltcp automatically sends an ICMP
+  Destination Unreachable (Port Unreachable) message to the sender.
+
+## Creating a socket
+
+A UDP socket takes separate packet buffers for receive and transmit. Each buffer is a
+`PacketBuffer` — a ring of fixed-size packet slots, each holding a metadata entry and a
+payload slice.
+
+```rust
+use smoltcp::socket::udp;
+
+// Allocate space for 4 received packets, each up to 1024 bytes
+let rx_meta = vec![udp::PacketMetadata::EMPTY; 4];
+let rx_payload = vec![0u8; 4096];
+let rx_buffer = udp::PacketBuffer::new(rx_meta, rx_payload);
+
+// Allocate space for 4 transmit packets, each up to 1024 bytes
+let tx_meta = vec![udp::PacketMetadata::EMPTY; 4];
+let tx_payload = vec![0u8; 4096];
+let tx_buffer = udp::PacketBuffer::new(tx_meta, tx_payload);
+
+let socket = udp::Socket::new(rx_buffer, tx_buffer);
+let socket_handle = socket_set.add(socket);
+```
+
+## Binding
+
+Before the socket can receive packets, bind it to a local endpoint. You can bind to a port
+only (accepts packets on any local address) or to a specific address and port.
+
+```rust
+use smoltcp::socket::udp;
+
+let socket = socket_set.get_mut::<udp::Socket>(handle);
+
+// Bind to port 6969 on any address
+socket.bind(6969).unwrap();
+```
+
+## Sending and receiving
+
+<Steps>
+  <Step title="Send a datagram">
+    Pass the payload and the destination `UdpMetadata` (which can be constructed from any
+    `IpEndpoint`) to `send_slice`:
+
+    ```rust
+    use smoltcp::wire::{IpAddress, IpEndpoint};
+
+    let socket = socket_set.get_mut::<udp::Socket>(handle);
+
+    let dest = IpEndpoint::new(IpAddress::v4(192, 168, 1, 1), 9999);
+    socket.send_slice(b"hello", dest).unwrap();
+    ```
+  </Step>
+
+  <Step title="Receive a datagram">
+    `recv_slice` fills a buffer with the next available datagram and returns the number of
+    bytes written plus the sender's `UdpMetadata`:
+
+    ```rust
+    let socket = socket_set.get_mut::<udp::Socket>(handle);
+
+    if socket.can_recv() {
+        let mut buf = [0u8; 1024];
+        let (n, meta) = socket.recv_slice(&mut buf).unwrap();
+        let data = &buf[..n];
+        let sender = meta.endpoint; // IpEndpoint
+    }
+    ```
+  </Step>
+</Steps>
+
+## Packet metadata
+
+`UdpMetadata` carries the remote endpoint and, optionally, the local address that should be
+used for sending (or on which a packet was received). When sending, if `local_address` is left
+as `None`, smoltcp selects a source address automatically.
+
+When the `packetmeta-id` feature is enabled, `UdpMetadata` also carries a `PacketMeta` ID
+that lets you correlate outgoing packets with lower-layer events (such as transmission
+confirmation from the hardware).
+
+```toml
+smoltcp = { version = "0.13.0", features = ["socket-udp", "packetmeta-id"] }
+```
+
+```rust
+use smoltcp::socket::udp::UdpMetadata;
+use smoltcp::wire::{IpAddress, IpEndpoint};
+
+let mut meta = UdpMetadata::from(IpEndpoint::new(IpAddress::v4(10, 0, 0, 1), 1234));
+meta.local_address = Some(IpAddress::v4(10, 0, 0, 2));
+socket.send_slice(b"data", meta).unwrap();
+```
+
+## Hop limit
+
+You can set a per-socket hop limit (IPv4 TTL or IPv6 hop limit) for outgoing packets.
+The default is 64.
+
+```rust
+socket.set_hop_limit(Some(128));
+```

@@ -1,0 +1,99 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "smoltcp",
+  "projectDescription": "A standalone, event-driven TCP/IP networking stack designed for bare-metal and real-time embedded systems with no heap allocation required.",
+  "theme": "aspen",
+  "primaryColor": "#7c7c7c",
+  "lightColor": "#121212",
+  "darkColor": "#c9c9c9",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "feature-flags"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/sockets",
+              "concepts/interface",
+              "concepts/physical-layer"
+            ]
+          },
+          {
+            "group": "Protocols",
+            "pages": [
+              "protocols/ipv4",
+              "protocols/ipv6",
+              "protocols/tcp",
+              "protocols/udp",
+              "protocols/icmp",
+              "protocols/sixlowpan"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/bare-metal",
+              "guides/hosted-linux",
+              "guides/no-std",
+              "guides/configuration"
+            ]
+          },
+          {
+            "group": "Examples",
+            "pages": [
+              "examples/overview",
+              "examples/tcp-server-client",
+              "examples/dhcp",
+              "examples/dns"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "No heap allocation required — works on bare-metal systems",
+    "IPv4 and IPv6 support including fragmentation and reassembly",
+    "TCP with congestion control (CUBIC and Reno), window scaling, and keep-alive",
+    "UDP, ICMP, DHCPv4, and DNS socket types",
+    "6LoWPAN support for IEEE 802.15.4 (IoT) networks",
+    "Ethernet, IP, and IEEE 802.15.4 medium adapters",
+    "Event-driven, poll-based interface — no threads or OS required",
+    "Async/await support via the `async` feature flag",
+    "defmt and log integration for embedded and hosted logging",
+    "Fault injection and packet tracing middleware for debugging",
+    "Achieves ~Gbps throughput against Linux TCP stack"
+  ],
+  "publicApiSurface": [
+    "smoltcp::iface::Interface — main network interface struct",
+    "smoltcp::iface::SocketSet — manages a collection of sockets",
+    "smoltcp::iface::Config — interface configuration",
+    "smoltcp::iface::Routes — IP routing table",
+    "smoltcp::socket::tcp::Socket — TCP socket",
+    "smoltcp::socket::udp::Socket — UDP socket",
+    "smoltcp::socket::icmp::Socket — ICMP socket",
+    "smoltcp::socket::raw::Socket — raw IP socket",
+    "smoltcp::socket::dhcpv4::Socket — DHCPv4 client socket",
+    "smoltcp::socket::dns::Socket — DNS resolver socket",
+    "smoltcp::phy::Device — trait for network device drivers",
+    "smoltcp::phy::RxToken / TxToken — receive/transmit token traits",
+    "smoltcp::phy::Loopback — loopback device for testing",
+    "smoltcp::phy::RawSocket — raw OS socket device (Linux)",
+    "smoltcp::phy::TunTapInterface — TUN/TAP device (Linux)",
+    "smoltcp::phy::FaultInjector — packet fault injection middleware",
+    "smoltcp::phy::Tracer — packet tracing middleware",
+    "smoltcp::wire — packet representation and parsing layer",
+    "smoltcp::time::Instant / Duration — time types",
+    "smoltcp::config — compile-time configuration constants"
+  ]
+}

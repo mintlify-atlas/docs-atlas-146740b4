@@ -1,0 +1,81 @@
+---
+title: "Architecture"
+description: "How smoltcp's four-layer design maps to TCP/IP."
+---
+
+smoltcp is built as a set of composable layers, each fully exposed as a Rust module. Unlike most embedded TCP/IP stacks that hide implementation details behind a single opaque API, smoltcp lets you work at any layer directly. A typical application only touches the socket and interface layers, but the lower layers are available when you need them.
+
+The four layers, from lowest to highest, are:
+
+<CardGroup cols={2}>
+  <Card title="smoltcp::wire" icon="layer-group">
+    Packet representation and parsing. Provides structured access to raw bytes for every protocol smoltcp understands. The "make illegal states unrepresentable" design means a successfully constructed wire object is always valid.
+  </Card>
+  <Card title="smoltcp::phy" icon="microchip">
+    Device driver interface. Defines the `Device` trait your hardware driver implements to send and receive raw frames. Includes built-in implementations for Linux raw sockets, TUN/TAP interfaces, and a loopback device for testing.
+  </Card>
+  <Card title="smoltcp::iface" icon="network-wired">
+    Network interface. The central coordinator that drives ARP/NDISC neighbor discovery, routes packets to and from sockets, and owns the routing table and IP address configuration.
+  </Card>
+  <Card title="smoltcp::socket" icon="plug">
+    Application API. TCP, UDP, ICMP, raw, DHCPv4, and DNS sockets. Each socket type owns its own TX and RX ring buffers, which you allocate and pass in explicitly.
+  </Card>
+</CardGroup>
+
+## Data flow
+
+When a frame arrives from hardware, it travels upward through the layers:
+
+```
+Hardware frame
+    │
+    ▼
+smoltcp::phy  — RxToken::consume() delivers raw bytes
+    │
+    ▼
+smoltcp::wire — parse into structured packet representation
+    │
+    ▼
+smoltcp::iface — route to matching socket; handle ARP/NDISC in-band
+    │
+    ▼
+smoltcp::socket — deliver payload into socket RX buffer
+    │
+    ▼
+Your application — reads from the socket
+```
+
+When your application sends data, the flow reverses: the socket places data in its TX buffer, `iface.poll()` drains it, the wire layer encodes the packet, and `TxToken::consume()` hands the bytes to your device driver.
+
+## The wire layer: making illegal states unrepresentable
+
+The `smoltcp::wire` module is split into two sublayers:
+
+**Packet layer** — provides structured field access over a raw `&[u8]` or `&mut [u8]` without copying, using zero-cost wrappers like `Ipv4Packet<T>` and `TcpPacket<T>`. It imposes no validity judgement beyond what's needed to safely index into the buffer — it will parse (and log) packets that the representation layer would reject.
+
+**Representation layer** — strips away ambiguity. A `TcpRepr`, `Ipv4Repr`, or `EthernetRepr` value can only be constructed if the corresponding wire data is well-formed and contains only features smoltcp supports. If construction succeeds, the value can be emitted back to bytes without failure.
+
+This design means protocol logic throughout smoltcp works with typed `Repr` values rather than raw bytes, eliminating an entire class of bugs caused by malformed or partially initialised packet fields.
+
+## How the interface routes packets to sockets
+
+`Interface::poll()` is the engine of the stack. On each call it:
+
+1. Drains all pending frames from the device via `Device::receive()`.
+2. Parses each frame through the wire layer.
+3. Matches the destination address and protocol against registered sockets.
+4. Delivers matched payloads into socket RX buffers.
+5. Drains socket TX buffers and dispatches outgoing frames via `Device::transmit()`.
+6. Handles control traffic — ARP requests and replies, NDISC Neighbor Solicitations and Advertisements — without requiring any socket registration.
+
+Sockets do not receive raw frames; they receive already-parsed payloads. All protocol-level routing decisions happen inside `iface`, keeping socket implementations free of medium-specific concerns.
+
+## Module map
+
+| Module | What you use from it |
+|---|---|
+| `smoltcp::wire` | Packet types for manual frame construction or inspection |
+| `smoltcp::phy` | `Device`, `RxToken`, `TxToken`, `DeviceCapabilities`, `Medium` |
+| `smoltcp::iface` | `Interface`, `Config`, `SocketSet`, `SocketHandle`, `Routes`, `Route` |
+| `smoltcp::socket` | `tcp::Socket`, `udp::Socket`, `icmp::Socket`, `raw::Socket`, `dhcpv4::Socket`, `dns::Socket` |
+| `smoltcp::time` | `Instant`, `Duration` — used throughout for monotonic timestamps |

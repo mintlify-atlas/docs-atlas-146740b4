@@ -1,80 +1,309 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Add smoltcp to your Rust project and run your first networking application."
 ---
 
-## Get started in three steps
+smoltcp is an event-driven TCP/IP stack that you drive by calling `iface.poll()` in a loop. There is no background thread and no OS involvement — you supply the buffers, you call the clock, you decide when to poll.
 
-Get your documentation site running locally and make your first customization.
+## Installation
 
-### Step 1: Set up your local environment
+Add smoltcp to your `Cargo.toml`. The default feature set includes `std`, all socket types, and both IPv4 and IPv6, which is convenient for evaluation on a hosted machine.
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+<CodeGroup>
 
-### Step 2: Deploy your changes
+```toml Default (hosted)
+[dependencies]
+smoltcp = "0.13.0"
+```
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+```toml Selective features (bare-metal / embedded)
+[dependencies]
+smoltcp = { version = "0.13.0", default-features = false, features = [
+    "log",
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+] }
+```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+</CodeGroup>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+<Note>
+  Always use `default-features = false` for bare-metal targets. The default feature set depends on `std`, which is unavailable on most embedded targets.
+</Note>
 
-### Step 3: Go live
+## Run the loopback example
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+The loopback example is the simplest self-contained program that exercises the full stack. It opens a TCP server and client on `127.0.0.1:1234`, sends 16 bytes, receives them, and exits.
+
+Run it with `std`:
+
+```bash
+cargo run --example loopback
+```
+
+Run it without `std` (requires `alloc`):
+
+```bash
+cargo run --example loopback \
+  --no-default-features \
+  --features "log proto-ipv4 socket-tcp alloc"
+```
+
+You can pass `--pcap loopback.pcap` when running with `std` to capture a Wireshark-compatible trace of the packet exchange.
+
+## Build a minimal application
+
+The following walks through the loopback example code to show the four components every smoltcp application needs.
+
+<Steps>
+
+<Step title="Create a device">
+  A device implements `phy::Device` — the trait that lets smoltcp send and receive raw frames. For testing you can use the built-in `Loopback` device. For real hardware you implement `Device` yourself (see [the `phy` module docs](https://docs.rs/smoltcp/latest/smoltcp/phy/index.html)).
+
+  ```rust
+  use smoltcp::phy::{Loopback, Medium};
+
+  let mut device = Loopback::new(Medium::Ethernet);
+  ```
+
+  The `Medium` tells smoltcp what kind of frames your hardware produces. Use `Medium::Ethernet` for Ethernet and Wi-Fi devices, `Medium::Ip` for TUN-style interfaces, and `Medium::Ieee802154` for 802.15.4 radios.
+</Step>
+
+<Step title="Create an interface">
+  `Interface` handles ARP, neighbor discovery, routing, and dispatching packets to sockets. You give it a `Config` that carries the hardware address, then assign at least one IP address.
+
+  ```rust
+  use smoltcp::iface::{Config, Interface};
+  use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr};
+  use smoltcp::time::Instant;
+
+  let config = Config::new(
+      EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).into(),
+  );
+
+  let mut iface = Interface::new(config, &mut device, Instant::now());
+  iface.update_ip_addrs(|ip_addrs| {
+      ip_addrs
+          .push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8))
+          .unwrap();
+  });
+  ```
+</Step>
+
+<Step title="Create sockets and a SocketSet">
+  Sockets own their RX and TX buffers. You allocate the backing storage yourself — either as static arrays (recommended on embedded targets to catch overflows at link time) or as heap-allocated `Vec`.
+
+  ```rust
+  use smoltcp::iface::SocketSet;
+  use smoltcp::socket::tcp;
+
+  // Static buffers — safe for no_std / no-alloc targets
+  static mut TCP_SERVER_RX: [u8; 1024] = [0; 1024];
+  static mut TCP_SERVER_TX: [u8; 1024] = [0; 1024];
+
+  let rx_buf = tcp::SocketBuffer::new(unsafe { &mut TCP_SERVER_RX[..] });
+  let tx_buf = tcp::SocketBuffer::new(unsafe { &mut TCP_SERVER_TX[..] });
+  let server_socket = tcp::Socket::new(rx_buf, tx_buf);
+
+  let mut sockets: [_; 1] = Default::default();
+  let mut sockets = SocketSet::new(&mut sockets[..]);
+  let server_handle = sockets.add(server_socket);
+  ```
+
+  `sockets.add()` returns a `SocketHandle` you use later to retrieve the socket from the set.
+</Step>
+
+<Step title="Drive the poll loop">
+  Call `iface.poll()` to process incoming packets and advance all socket state machines. Then interact with your sockets. Finally, call `iface.poll_delay()` to find out how long you can sleep before polling again.
+
+  ```rust
+  use smoltcp::time::{Duration, Instant};
+
+  loop {
+      // 1. Process incoming packets and run protocol state machines
+      iface.poll(clock.elapsed(), &mut device, &mut sockets);
+
+      // 2. Read from / write to sockets
+      let socket = sockets.get_mut::<tcp::Socket>(server_handle);
+      if !socket.is_active() && !socket.is_listening() {
+          socket.listen(1234).unwrap();
+      }
+      if socket.can_recv() {
+          socket.recv(|buf| (buf.len(), ())).unwrap();
+          socket.close();
+      }
+
+      // 3. Sleep until the next scheduled event (or a short timeout)
+      match iface.poll_delay(clock.elapsed(), &sockets) {
+          Some(Duration::ZERO) => {}                  // poll again immediately
+          Some(delay) => clock.advance(delay),        // sleep for exactly `delay`
+          None => clock.advance(Duration::from_millis(1)), // no timer, sleep briefly
+      }
+  }
+  ```
+
+  <Note>
+    `iface.poll()` is not blocking. It processes whatever frames are currently available in the device's receive queue and returns. You must call it again whenever new data may have arrived.
+  </Note>
+</Step>
+
+</Steps>
+
+## Complete working example
+
+The following is the full loopback example from the smoltcp repository. It transfers 16 bytes between a server and client socket over a loopback device.
+
+```rust
+#![cfg_attr(not(feature = "std"), no_std)]
+
+use core::str;
+use log::{debug, error, info};
+
+use smoltcp::iface::{Config, Interface, SocketSet};
+use smoltcp::phy::{Device, Loopback, Medium};
+use smoltcp::socket::tcp;
+use smoltcp::time::{Duration, Instant};
+use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr};
+
+fn main() {
+    // -- Device ----------------------------------------------------------
+    let device = Loopback::new(Medium::Ethernet);
+
+    // -- Interface -------------------------------------------------------
+    let config = Config::new(
+        EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).into(),
+    );
+    let mut iface = Interface::new(config, &mut device, Instant::now());
+    iface.update_ip_addrs(|ip_addrs| {
+        ip_addrs
+            .push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8))
+            .unwrap();
+    });
+
+    // -- Sockets ---------------------------------------------------------
+    static mut TCP_SERVER_RX_DATA: [u8; 1024] = [0; 1024];
+    static mut TCP_SERVER_TX_DATA: [u8; 1024] = [0; 1024];
+    let server_socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(unsafe { &mut TCP_SERVER_RX_DATA[..] }),
+        tcp::SocketBuffer::new(unsafe { &mut TCP_SERVER_TX_DATA[..] }),
+    );
+
+    static mut TCP_CLIENT_RX_DATA: [u8; 1024] = [0; 1024];
+    static mut TCP_CLIENT_TX_DATA: [u8; 1024] = [0; 1024];
+    let client_socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(unsafe { &mut TCP_CLIENT_RX_DATA[..] }),
+        tcp::SocketBuffer::new(unsafe { &mut TCP_CLIENT_TX_DATA[..] }),
+    );
+
+    let mut sockets: [_; 2] = Default::default();
+    let mut sockets = SocketSet::new(&mut sockets[..]);
+    let server_handle = sockets.add(server_socket);
+    let client_handle = sockets.add(client_socket);
+
+    // -- Poll loop -------------------------------------------------------
+    // Replace with your monotonic millisecond clock (hardware timer or std::time).
+    let mut elapsed_ms: i64 = 0;
+    let mut did_listen = false;
+    let mut did_connect = false;
+    let mut done = false;
+
+    while !done && Instant::from_millis(elapsed_ms) < Instant::from_millis(10_000) {
+        let now = Instant::from_millis(elapsed_ms);
+        iface.poll(now, &mut device, &mut sockets);
+
+        // Server: listen, then receive and close
+        let mut socket = sockets.get_mut::<tcp::Socket>(server_handle);
+        if !socket.is_active() && !socket.is_listening() {
+            if !did_listen {
+                socket.listen(1234).unwrap();
+                did_listen = true;
+            }
+        }
+        if socket.can_recv() {
+            socket.recv(|buffer| {
+                (buffer.len(), str::from_utf8(buffer).unwrap())
+            });
+            socket.close();
+            done = true;
+        }
+
+        // Client: connect, send, and close
+        let mut socket = sockets.get_mut::<tcp::Socket>(client_handle);
+        let cx = iface.context();
+        if !socket.is_open() {
+            if !did_connect {
+                socket
+                    .connect(cx, (IpAddress::v4(127, 0, 0, 1), 1234), 65000)
+                    .unwrap();
+                did_connect = true;
+            }
+        }
+        if socket.can_send() {
+            socket.send_slice(b"0123456789abcdef").unwrap();
+            socket.close();
+        }
+
+        match iface.poll_delay(now, &sockets) {
+            Some(Duration::ZERO) => {}
+            Some(delay) => elapsed_ms += delay.total_millis(),
+            None => elapsed_ms += 1,
+        }
+    }
+
+    if done {
+        info!("done")
+    } else {
+        error!("this is taking too long, bailing out")
+    }
+}
+```
+
+## Implement your own device (bare-metal)
+
+On real hardware you implement the `phy::Device` trait to connect smoltcp to your network driver. You need to provide two token types — one for receive and one for transmit — and three methods:
+
+```rust
+use smoltcp::phy::{self, DeviceCapabilities, Medium};
+use smoltcp::time::Instant;
+
+struct MyEthDriver {
+    rx_buffer: [u8; 1536],
+    tx_buffer: [u8; 1536],
+}
+
+impl phy::Device for MyEthDriver {
+    type RxToken<'a> = MyRxToken<'a> where Self: 'a;
+    type TxToken<'a> = MyTxToken<'a> where Self: 'a;
+
+    fn receive(&mut self, _timestamp: Instant)
+        -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)>
+    {
+        // Return Some only when a frame is available in the RX buffer
+        Some((MyRxToken(&mut self.rx_buffer[..]),
+              MyTxToken(&mut self.tx_buffer[..])))
+    }
+
+    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        Some(MyTxToken(&mut self.tx_buffer[..]))
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut caps = DeviceCapabilities::default();
+        caps.max_transmission_unit = 1536;
+        caps.medium = Medium::Ethernet;
+        caps
+    }
+}
+```
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Feature flags" icon="toggle-on" href="/feature-flags">
+    Enable only the protocols and socket types your project needs to minimize binary size.
+  </Card>
+  <Card title="Architecture" icon="layer-group" href="/concepts/architecture">
+    Understand how the wire, phy, iface, and socket layers fit together.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

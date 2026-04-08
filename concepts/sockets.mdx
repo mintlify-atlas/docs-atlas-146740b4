@@ -1,0 +1,198 @@
+---
+title: "Sockets"
+description: "Working with TCP, UDP, ICMP, raw, DHCPv4, and DNS sockets in smoltcp."
+---
+
+smoltcp sockets differ from Berkeley sockets in one fundamental way: **you supply the buffers**. There is no operating system allocating memory on your behalf. You decide how large the transmit and receive buffers should be, allocate them (on the stack, in a static, or on the heap), and pass them to the socket constructor. The stack uses your buffers directly — no hidden copies, no hidden allocations.
+
+<Note>
+This explicit buffer model is what makes smoltcp usable on microcontrollers with kilobytes of RAM. You pay only for the buffering capacity you actually need.
+</Note>
+
+## Socket types
+
+<Tabs>
+  <Tab title="TCP">
+    `smoltcp::socket::tcp::Socket` implements the full RFC 793 state machine — LISTEN, SYN-SENT, SYN-RECEIVED, ESTABLISHED, FIN-WAIT-1, FIN-WAIT-2, CLOSE-WAIT, CLOSING, LAST-ACK, TIME-WAIT, CLOSED — plus RFC 1122 requirements and RFC 7323 TCP timestamps.
+
+    You create a TCP socket by providing a receive buffer and a transmit buffer, both of type `tcp::SocketBuffer<'a>` (a type alias for `RingBuffer<'a, u8>`):
+
+    ```rust
+    use smoltcp::socket::tcp;
+
+    // Allocate buffers. These can be static arrays, Vec, or any &mut [u8].
+    let tcp_rx_buffer = tcp::SocketBuffer::new(vec![0; 4096]);
+    let tcp_tx_buffer = tcp::SocketBuffer::new(vec![0; 4096]);
+
+    let socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);
+    ```
+
+    After adding the socket to a `SocketSet` (see below), you call `listen()` or `connect()` on it, then `send()` / `recv()` once the connection is established.
+
+    The socket reports `SendError::InvalidState` or `RecvError::InvalidState` when called in the wrong state, and `RecvError::Finished` when the remote peer has closed the connection.
+  </Tab>
+  <Tab title="UDP">
+    `smoltcp::socket::udp::Socket` is connectionless. Its buffers are packet buffers (`udp::PacketBuffer<'a>`), which store whole datagrams with per-packet metadata rather than a stream of bytes.
+
+    ```rust
+    use smoltcp::socket::udp;
+
+    // PacketMetadata stores endpoint + PacketMeta per datagram.
+    // The second argument is the payload byte buffer.
+    let udp_rx_buffer = udp::PacketBuffer::new(
+        vec![udp::PacketMetadata::EMPTY; 16],
+        vec![0; 65535],
+    );
+    let udp_tx_buffer = udp::PacketBuffer::new(
+        vec![udp::PacketMetadata::EMPTY; 16],
+        vec![0; 65535],
+    );
+
+    let socket = udp::Socket::new(udp_rx_buffer, udp_tx_buffer);
+    ```
+
+    Each received datagram carries a `UdpMetadata` value containing the remote endpoint (`IpEndpoint`) and the local address it was sent to. You can inspect or set `PacketMeta` on outgoing datagrams when the `packetmeta-id` feature is enabled.
+  </Tab>
+  <Tab title="ICMP">
+    `smoltcp::socket::icmp::Socket` sends and receives ICMP (v4 or v6) echo requests and replies. Like UDP, it uses a packet buffer model.
+
+    Enable it with the `socket-icmp` feature.
+  </Tab>
+  <Tab title="Raw">
+    `smoltcp::socket::raw::Socket` gives access to raw IP payloads, filtered by IP protocol number. The interface layer passes every matching IP packet to every registered raw socket before attempting protocol-specific processing.
+
+    Enable it with the `socket-raw` feature.
+  </Tab>
+  <Tab title="DHCPv4">
+    `smoltcp::socket::dhcpv4::Socket` is a DHCP client. It requires no TX/RX buffers — it manages its own internal state. After polling, you call `socket.poll()` to retrieve `dhcpv4::Event` values, which report when a lease is acquired or released.
+
+    Enable it with the `socket-dhcpv4` feature.
+  </Tab>
+  <Tab title="DNS">
+    `smoltcp::socket::dns::Socket` is a DNS stub resolver. You send queries via `socket.start_query()` and retrieve results via `socket.get_query_result()`. It supports `A` (IPv4) and `AAAA` (IPv6) record lookups.
+
+    Enable it with the `socket-dns` feature.
+  </Tab>
+</Tabs>
+
+## SocketSet
+
+`SocketSet` owns a collection of sockets. You create it by giving it a backing slice of `SocketStorage` values — one slot per socket you plan to store:
+
+```rust
+use smoltcp::iface::{SocketSet, SocketStorage};
+
+// Fixed-size storage for up to 4 sockets (no heap required).
+let mut socket_storage = [SocketStorage::EMPTY; 4];
+let mut sockets = SocketSet::new(&mut socket_storage[..]);
+```
+
+If you have `alloc` available, you can pass a `Vec<SocketStorage>` instead, which grows automatically.
+
+### Adding sockets and getting handles
+
+`SocketSet::add()` accepts any type that implements `AnySocket` — all six socket types do — and returns a `SocketHandle`:
+
+```rust
+use smoltcp::socket::tcp;
+
+let tcp_rx_buffer = tcp::SocketBuffer::new(vec![0; 4096]);
+let tcp_tx_buffer = tcp::SocketBuffer::new(vec![0; 4096]);
+let tcp_socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);
+
+let tcp_handle = sockets.add(tcp_socket);
+```
+
+`SocketHandle` is a cheap `Copy` value (a `usize` index). Store it and use it to retrieve the socket later.
+
+### Accessing sockets by handle
+
+Use `SocketSet::get()` and `SocketSet::get_mut()` to borrow a socket by its handle. You must provide the concrete type as a type parameter — the call panics if the handle refers to a socket of a different type:
+
+```rust
+let socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
+socket.listen(80).unwrap();
+```
+
+### Removing sockets
+
+```rust
+let socket = sockets.remove(tcp_handle); // returns the Socket<'a> enum value
+```
+
+## The AnySocket trait
+
+Each concrete socket type implements `AnySocket<'a>`, which provides `upcast()` (to the `Socket<'a>` enum) and `downcast()` / `downcast_mut()` (from the enum back to the concrete type):
+
+```rust
+// Iterate all sockets, processing only TCP ones:
+for (handle, socket) in sockets.iter_mut() {
+    if let Some(tcp) = tcp::Socket::downcast_mut(socket) {
+        // tcp is &mut tcp::Socket here
+        if tcp.may_recv() {
+            let data = tcp.recv(|buf| (buf.len(), buf)).unwrap();
+        }
+    }
+}
+```
+
+`SocketSet::get()` uses `downcast` internally, so you rarely need to call it directly.
+
+## Full example: TCP echo server
+
+```rust
+use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
+use smoltcp::socket::tcp;
+use smoltcp::time::Instant;
+use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
+
+// 1. Build socket buffers and socket.
+let tcp_rx_buffer = tcp::SocketBuffer::new(vec![0u8; 4096]);
+let tcp_tx_buffer = tcp::SocketBuffer::new(vec![0u8; 4096]);
+let tcp_socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);
+
+// 2. Create the socket set and register the socket.
+let mut socket_storage = [SocketStorage::EMPTY; 1];
+let mut sockets = SocketSet::new(&mut socket_storage[..]);
+let tcp_handle = sockets.add(tcp_socket);
+
+// (iface setup omitted — see the Network interface page)
+
+// 3. Poll loop.
+loop {
+    let timestamp = Instant::now(); // your monotonic clock
+    iface.poll(timestamp, &mut device, &mut sockets);
+
+    let socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
+
+    if !socket.is_open() {
+        socket.listen(1234).unwrap();
+    }
+
+    if socket.may_recv() {
+        let received = socket.recv(|data| {
+            let len = data.len();
+            (len, data.to_vec())
+        }).unwrap();
+
+        if socket.may_send() {
+            socket.send_slice(&received).unwrap();
+        }
+    }
+}
+```
+
+## Polling
+
+Sockets are passive: they do not drive themselves. All protocol work — acknowledging received data, retransmitting lost segments, sending keepalives — happens when you call `iface.poll()`. Each socket internally exposes a `poll_at()` method that returns when it next needs service (`Now`, a specific `Instant`, or only on new ingress). `Interface::poll_at()` aggregates these across all sockets so you can sleep until the next deadline:
+
+```rust
+let deadline = iface.poll_at(timestamp, &sockets);
+if let Some(deadline) = deadline {
+    // sleep until deadline, then call iface.poll() again
+}
+```
+
+<Note>
+If you enable the `async` feature, sockets expose `register_send_waker()` and `register_recv_waker()` so you can integrate with an async executor without polling in a busy loop. The wakers are stored inside the socket and called when the socket state changes during `iface.poll()`.
+</Note>

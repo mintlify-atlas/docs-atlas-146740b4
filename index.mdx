@@ -1,97 +1,72 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "smoltcp"
+description: "A standalone, event-driven TCP/IP stack designed for bare-metal and real-time embedded systems — no heap allocation required."
 ---
 
-## Setting up
+smoltcp is a Rust TCP/IP networking library built for embedded and real-time systems. It runs without an OS, without heap allocation, and achieves ~Gbps throughput. Whether you are writing firmware for a microcontroller or testing network protocols in userspace, smoltcp gives you full control over every layer of the stack.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Add smoltcp to your project and send your first packet in minutes.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Feature flags" icon="toggle-on" href="/feature-flags">
+    Enable only the protocols and socket types your project needs.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Architecture" icon="layer-group" href="/concepts/architecture">
+    Understand the four-layer structure: wire, phy, iface, and socket.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Configuration" icon="sliders" href="/guides/configuration">
+    Tune buffer sizes, route counts, and more at compile time.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## What smoltcp provides
 
-Everything you need to create world-class documentation.
+<CardGroup cols={3}>
+  <Card title="TCP & UDP sockets" icon="network-wired" href="/concepts/sockets">
+    Full TCP state machine with congestion control, retransmission, and keep-alive. UDP with checksum validation.
+  </Card>
+  <Card title="IPv4 & IPv6" icon="globe" href="/protocols/ipv4">
+    Dual-stack support including fragmentation, reassembly, multicast, and SLAAC.
+  </Card>
+  <Card title="6LoWPAN" icon="wifi" href="/protocols/sixlowpan">
+    Compressed IPv6 over IEEE 802.15.4 for low-power IoT devices.
+  </Card>
+  <Card title="DHCPv4 & DNS" icon="server" href="/examples/dhcp">
+    Built-in DHCP client and DNS resolver sockets for hosted environments.
+  </Card>
+  <Card title="No heap required" icon="microchip" href="/guides/bare-metal">
+    All buffers are caller-supplied slices. Works on any `no_std` target.
+  </Card>
+  <Card title="Async support" icon="bolt" href="/concepts/interface">
+    Poll-based event loop with optional async/await via the `async` feature.
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Get started
 
-## Need inspiration?
+<Steps>
+  <Step title="Add smoltcp to Cargo.toml">
+    Choose the features you need and add the dependency:
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+    ```toml Cargo.toml
+    [dependencies]
+    smoltcp = { version = "0.13.0", default-features = false, features = [
+        "proto-ipv4", "socket-tcp", "medium-ethernet", "log"
+    ]}
+    ```
+  </Step>
+  <Step title="Implement the Device trait">
+    Wrap your hardware driver in the `phy::Device` trait to connect smoltcp to your network interface.
+  </Step>
+  <Step title="Create an Interface and SocketSet">
+    Configure an `Interface` with your IP address and routes, then create a `SocketSet` to hold your sockets.
+  </Step>
+  <Step title="Poll the interface in your main loop">
+    Call `iface.poll()` in your event loop to drive all protocol state machines and socket I/O.
+  </Step>
+</Steps>
+
+<Note>
+  smoltcp compiles on stable Rust 1.91 and later. Use `default-features = false` for bare-metal targets to avoid pulling in `std`.
+</Note>

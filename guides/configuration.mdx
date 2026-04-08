@@ -1,0 +1,204 @@
+---
+title: "Compile-time configuration"
+description: "Tuning smoltcp's buffer sizes, counts, and limits at compile time."
+---
+
+smoltcp exposes compile-time knobs for buffer sizes, cache counts, and protocol limits. All values are baked into the binary at build time via a generated `config.rs` file produced by `build.rs` — there is no runtime overhead.
+
+## Two ways to set a value
+
+You can configure each parameter in one of two ways:
+
+1. **Cargo feature** — enable a feature named `<param-name-with-dashes>-<value>`. For example, to set `IFACE_MAX_ADDR_COUNT` to 3: `iface-max-addr-count-3`. Only a fixed set of values is available per parameter; see the table below or `Cargo.toml` for the full list.
+
+2. **Environment variable** — set `SMOLTCP_<PARAM_NAME>` at build time to any positive integer. For example: `SMOLTCP_IFACE_MAX_ADDR_COUNT=3 cargo build`. Any value can be used, not just those listed as Cargo features.
+
+<Note>
+  Environment variables take precedence over Cargo features. If you enable two Cargo features for the same parameter with different values (e.g. both `iface-max-addr-count-3` and `iface-max-addr-count-4`), compilation fails with an error.
+</Note>
+
+## Setting values via `.cargo/config.toml`
+
+The recommended way to pin configuration for a project is through the `[env]` section of `.cargo/config.toml`. This keeps the settings version-controlled alongside your code and avoids shell environment dependencies:
+
+```toml
+# .cargo/config.toml
+[env]
+SMOLTCP_IFACE_MAX_ADDR_COUNT = "4"
+SMOLTCP_IFACE_NEIGHBOR_CACHE_COUNT = "16"
+SMOLTCP_REASSEMBLY_BUFFER_SIZE = "4096"
+SMOLTCP_REASSEMBLY_BUFFER_COUNT = "4"
+```
+
+## Setting a value via Cargo feature
+
+Alternatively, enable a feature directly in `Cargo.toml`:
+
+```toml
+[dependencies]
+smoltcp = { version = "0.13.0", default-features = false, features = [
+    "proto-ipv4",
+    "socket-tcp",
+    "medium-ethernet",
+    "iface-max-addr-count-4",        # override: 4 addresses instead of 2
+    "iface-neighbor-cache-count-16", # override: 16 ARP entries instead of 8
+] }
+```
+
+## Configuration parameters
+
+<AccordionGroup>
+  <Accordion title="IFACE_MAX_ADDR_COUNT — default: 2">
+    Maximum number of IP addresses (IPv4 and IPv6 combined) that can be assigned to a single interface.
+
+    | Method | Example |
+    |---|---|
+    | Cargo feature | `iface-max-addr-count-4` |
+    | Environment variable | `SMOLTCP_IFACE_MAX_ADDR_COUNT=4` |
+
+    Available feature values: 1 – 8.
+  </Accordion>
+
+  <Accordion title="IFACE_MAX_MULTICAST_GROUP_COUNT — default: 4">
+    Maximum number of multicast groups that a single interface can join.
+
+    | Method | Example |
+    |---|---|
+    | Cargo feature | `iface-max-multicast-group-count-8` |
+    | Environment variable | `SMOLTCP_IFACE_MAX_MULTICAST_GROUP_COUNT=8` |
+
+    Available feature values: 1 – 8, then powers of 2 up to 1024.
+  </Accordion>
+
+  <Accordion title="IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT — default: 4">
+    Maximum number of 6LoWPAN address contexts that can be assigned to a single interface. Only relevant when using `medium-ieee802154` and `proto-sixlowpan`.
+
+    | Method | Example |
+    |---|---|
+    | Cargo feature | `iface-max-sixlowpan-address-context-count-8` |
+    | Environment variable | `SMOLTCP_IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT=8` |
+
+    Available feature values: 1 – 8, then powers of 2 up to 1024.
+  </Accordion>
+
+  <Accordion title="IFACE_NEIGHBOR_CACHE_COUNT — default: 8">
+    Number of entries in the neighbor cache (also called the ARP cache or ARP table). Each entry maps an IP address to a hardware address.
+
+    | Method | Example |
+    |---|---|
+    | Cargo feature | `iface-neighbor-cache-count-16` |
+    | Environment variable | `SMOLTCP_IFACE_NEIGHBOR_CACHE_COUNT=16` |
+
+    Available feature values: 1 – 8, then powers of 2 up to 1024.
+  </Accordion>
+
+  <Accordion title="IFACE_MAX_ROUTE_COUNT — default: 2">
+    Maximum number of routes in the routing table of a single interface. This includes the default route and applies to both IPv4 and IPv6 routes.
+
+    | Method | Example |
+    |---|---|
+    | Cargo feature | `iface-max-route-count-4` |
+    | Environment variable | `SMOLTCP_IFACE_MAX_ROUTE_COUNT=4` |
+
+    Available feature values: 0 – 8, then powers of 2 up to 1024.
+  </Accordion>
+
+  <Accordion title="IFACE_MAX_PREFIX_COUNT — default: 1">
+    Maximum number of IPv6 prefixes that can be added to a single interface via SLAAC (Stateless Address Autoconfiguration). This value should be less than or equal to `IFACE_MAX_ADDR_COUNT`.
+
+    | Method | Example |
+    |---|---|
+    | Cargo feature | `iface-max-prefix-count-2` |
+    | Environment variable | `SMOLTCP_IFACE_MAX_PREFIX_COUNT=2` |
+
+    Available feature values: 1 – 8.
+  </Accordion>
+
+  <Accordion title="FRAGMENTATION_BUFFER_SIZE — default: 1500">
+    Size in bytes of the buffer used to fragment outgoing packets larger than the MTU. Packets larger than this value are dropped rather than fragmented. Only used when `proto-ipv4-fragmentation` or `proto-sixlowpan-fragmentation` is enabled.
+
+    | Method | Example |
+    |---|---|
+    | Cargo feature | `fragmentation-buffer-size-4096` |
+    | Environment variable | `SMOLTCP_FRAGMENTATION_BUFFER_SIZE=4096` |
+
+    Available feature values: 256, 512, 1024, 1500, then powers of 2 up to 65536.
+  </Accordion>
+
+  <Accordion title="ASSEMBLER_MAX_SEGMENT_COUNT — default: 4">
+    Maximum number of non-contiguous segments the packet assembler can track at once. This applies to both IP packet reassembly and TCP stream reassembly.
+
+    | Method | Example |
+    |---|---|
+    | Cargo feature | `assembler-max-segment-count-8` |
+    | Environment variable | `SMOLTCP_ASSEMBLER_MAX_SEGMENT_COUNT=8` |
+
+    Available feature values: 1 – 4, then powers of 2 up to 32.
+  </Accordion>
+
+  <Accordion title="REASSEMBLY_BUFFER_SIZE — default: 1500">
+    Size in bytes of a single reassembly buffer used to defragment incoming packets. If a reassembled packet would exceed this size, it is dropped.
+
+    | Method | Example |
+    |---|---|
+    | Cargo feature | `reassembly-buffer-size-4096` |
+    | Environment variable | `SMOLTCP_REASSEMBLY_BUFFER_SIZE=4096` |
+
+    Available feature values: 256, 512, 1024, 1500, then powers of 2 up to 65536.
+  </Accordion>
+
+  <Accordion title="REASSEMBLY_BUFFER_COUNT — default: 1">
+    Number of reassembly buffers available simultaneously, i.e. how many fragmented incoming packets can be reassembled at the same time.
+
+    | Method | Example |
+    |---|---|
+    | Cargo feature | `reassembly-buffer-count-4` |
+    | Environment variable | `SMOLTCP_REASSEMBLY_BUFFER_COUNT=4` |
+
+    Available feature values: 1 – 4, then powers of 2 up to 32.
+  </Accordion>
+
+  <Accordion title="DNS_MAX_RESULT_COUNT — default: 1">
+    Maximum number of address results kept per DNS query. If a queried name has more `A` or `AAAA` records than this value, only the first `N` results are returned. Requires `socket-dns`.
+
+    | Method | Example |
+    |---|---|
+    | Cargo feature | `dns-max-result-count-4` |
+    | Environment variable | `SMOLTCP_DNS_MAX_RESULT_COUNT=4` |
+
+    Available feature values: 1 – 4, then powers of 2 up to 32.
+  </Accordion>
+
+  <Accordion title="DNS_MAX_SERVER_COUNT — default: 1">
+    Maximum number of DNS servers that can be configured in a single DNS socket. Requires `socket-dns`.
+
+    | Method | Example |
+    |---|---|
+    | Cargo feature | `dns-max-server-count-2` |
+    | Environment variable | `SMOLTCP_DNS_MAX_SERVER_COUNT=2` |
+
+    Available feature values: 1 – 4, then powers of 2 up to 32.
+  </Accordion>
+
+  <Accordion title="DNS_MAX_NAME_SIZE — default: 255">
+    Maximum length in bytes of DNS names that can be queried. The DNS specification defines 255 as the maximum possible name length.
+
+    | Method | Example |
+    |---|---|
+    | Cargo feature | `dns-max-name-size-128` |
+    | Environment variable | `SMOLTCP_DNS_MAX_NAME_SIZE=128` |
+
+    Available feature values: 64, 128, 255.
+  </Accordion>
+
+  <Accordion title="IPV6_HBH_MAX_OPTIONS — default: 4">
+    Maximum number of options the IPv6 Hop-by-Hop extension header parser can hold. Requires `proto-ipv6-hbh`.
+
+    | Method | Example |
+    |---|---|
+    | Cargo feature | `ipv6-hbh-max-options-8` |
+    | Environment variable | `SMOLTCP_IPV6_HBH_MAX_OPTIONS=8` |
+
+    Available feature values: 1 – 4, then powers of 2 up to 32.
+  </Accordion>
+</AccordionGroup>

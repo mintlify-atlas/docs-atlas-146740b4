@@ -1,0 +1,140 @@
+---
+title: "Hosted usage on Linux"
+description: "Running smoltcp in userspace on Linux using TUN/TAP interfaces."
+---
+
+smoltcp is a freestanding networking stack — it needs a way to transmit and receive raw frames. On Linux, you can run it in a regular userspace process using either a `TunTapInterface` (a virtual Ethernet or IP device) or a `RawSocket` (over a real interface). This lets you develop, test, and benchmark smoltcp without any embedded hardware.
+
+## Required features
+
+Add smoltcp to your `Cargo.toml` with the features needed for Linux userspace:
+
+```toml
+[dependencies]
+smoltcp = { version = "0.13.0", features = [
+    "std",
+    "medium-ethernet",
+    "phy-tuntap_interface",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+] }
+```
+
+`phy-tuntap_interface` enables `smoltcp::phy::TunTapInterface` and automatically pulls in `std` and `libc`. `phy-raw_socket` enables `smoltcp::phy::RawSocket` for use on real Ethernet interfaces.
+
+## Setting up a tap interface
+
+On Linux you can create a persistent TAP interface owned by your user, so the examples run without `sudo`:
+
+<Steps>
+  <Step title="Create the tap interface">
+    ```sh
+    sudo ip tuntap add name tap0 mode tap user $USER
+    sudo ip link set tap0 up
+    ```
+  </Step>
+
+  <Step title="Assign IPv4 and IPv6 addresses">
+    ```sh
+    sudo ip addr add 192.168.69.100/24 dev tap0
+    sudo ip -6 addr add fe80::100/64 dev tap0
+    sudo ip -6 addr add fdaa::100/64 dev tap0
+    sudo ip -6 route add fe80::/64 dev tap0
+    sudo ip -6 route add fdaa::/64 dev tap0
+    ```
+
+    These addresses are assigned to the **host** side of the tap. smoltcp assigns its own address (e.g. `192.168.69.1`) on the other side.
+  </Step>
+</Steps>
+
+## Providing internet access
+
+<Tabs>
+  <Tab title="Routed (NAT)">
+    Enable IP forwarding and masquerade traffic from the tap subnet. This gives smoltcp access to the internet through your host's default route.
+
+    ```sh
+    # IPv4 NAT
+    sudo iptables -t nat -A POSTROUTING -s 192.168.69.0/24 -j MASQUERADE
+    sudo sysctl net.ipv4.ip_forward=1
+
+    # Allow forwarding in both directions
+    sudo iptables -A FORWARD -i tap0 -s 192.168.69.0/24 -j ACCEPT
+    sudo iptables -A FORWARD -o tap0 -d 192.168.69.0/24 -j ACCEPT
+
+    # IPv6 NAT
+    sudo ip6tables -t nat -A POSTROUTING -s fdaa::/64 -j MASQUERADE
+    sudo sysctl -w net.ipv6.conf.all.forwarding=1
+    ```
+
+    smoltcp will communicate with the host at `192.168.69.100` and reach external hosts via the NAT gateway.
+  </Tab>
+  <Tab title="Bridged (switched)">
+    A bridged connection connects the tap interface directly to your LAN, giving smoltcp a real presence on your network segment with genuine ARP. This is required for DHCP examples.
+
+    ```sh
+    # Replace with your wired Ethernet interface name
+    ETH=enp0s20f0u1u1
+
+    sudo modprobe bridge
+    sudo modprobe br_netfilter
+
+    sudo sysctl -w net.bridge.bridge-nf-call-arptables=0
+    sudo sysctl -w net.bridge.bridge-nf-call-ip6tables=0
+    sudo sysctl -w net.bridge.bridge-nf-call-iptables=0
+
+    sudo ip tuntap add name tap0 mode tap user $USER
+    sudo brctl addbr br0
+    sudo brctl addif br0 tap0
+    sudo brctl addif br0 $ETH
+    sudo ip link set tap0 up
+    sudo ip link set $ETH up
+    sudo ip link set br0 up
+
+    # Get a host address for the bridge so you can use it alongside the examples
+    sudo dhcpcd br0
+    ```
+
+    To tear down the bridge:
+
+    ```sh
+    sudo killall dhcpcd
+    sudo ip link set br0 down
+    sudo brctl delbr br0
+    ```
+
+    <Note>
+      The IP configuration in the example must match your LAN's subnet. When running the DHCP example, smoltcp will obtain an address from your actual DHCP server.
+    </Note>
+  </Tab>
+</Tabs>
+
+<Note>
+  Bridged mode only works with wired Ethernet connections. Wi-Fi drivers on Linux do not pass Ethernet frames to bridge interfaces, so the bridge will not forward traffic from a wireless adapter.
+</Note>
+
+## Fault injection
+
+All hosted examples accept command-line flags to simulate adverse network conditions:
+
+| Flag | Description |
+|---|---|
+| `--drop-chance <pct>` | Randomly drops packets with the given probability (in percent). A value of 15 is a good starting point. |
+| `--corrupt-chance <pct>` | Randomly mutates one octet in a packet with the given probability (in percent). |
+| `--size-limit <bytes>` | Drops any packet larger than the specified byte count. |
+| `--tx-rate-limit <n>` | Sets the token bucket size for outgoing packets (packets per bucket). |
+| `--rx-rate-limit <n>` | Sets the token bucket size for incoming packets (packets per bucket). |
+| `--shaping-interval <ms>` | Sets the token bucket refill interval in milliseconds. |
+
+A practical starting point for rate limiting is `--tx-rate-limit 4 --rx-rate-limit 4 --shaping-interval 50`.
+
+Packets dropped by the fault injector are still traced: a `rx: randomly dropping a packet` log line means the packet printed above it was dropped; `tx: randomly dropping a packet` means the packet printed below it was dropped.
+
+## Packet capture
+
+Every example accepts a `--pcap <file>` option that writes a libpcap-format file containing every packet as smoltcp sees it. Open the file in Wireshark to inspect the full packet exchange:
+
+```sh
+cargo run --example server -- --tap tap0 --pcap capture.pcap
+```

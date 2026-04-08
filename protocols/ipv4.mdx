@@ -1,0 +1,154 @@
+---
+title: "IPv4"
+description: "IPv4 protocol support in smoltcp: addressing, routing, fragmentation, and DHCP."
+---
+
+smoltcp supports IPv4 over Ethernet, IP, and IEEE 802.15.4 (via 6LoWPAN) media. The implementation
+covers the features most embedded systems need, with a deliberate focus on simplicity.
+
+## Supported features
+
+- Header checksum generation and validation on all outgoing and incoming packets
+- Configurable time-to-live (TTL), defaulting to 64 per the IANA recommendation
+- Default gateway routing
+- CIDR route table for outgoing packets
+- Fragmentation of outgoing packets larger than the MTU
+- Reassembly of incoming fragmented packets
+- IGMPv1 and IGMPv2 multicast group membership (with the `multicast` feature)
+
+<Note>
+IPv4 options are silently ignored. Packets containing options are still processed; smoltcp
+does not generate any error in response to unknown options.
+</Note>
+
+## Feature flags
+
+Enable IPv4 support and related features in your `Cargo.toml`:
+
+```toml
+[dependencies]
+smoltcp = { version = "0.13.0", default-features = false, features = [
+    "proto-ipv4",
+    "proto-ipv4-fragmentation", # optional: fragmentation and reassembly
+    "proto-dhcpv4",             # optional: DHCP client
+    "multicast",                # optional: IGMP multicast support
+] }
+```
+
+| Feature | Description |
+|---|---|
+| `proto-ipv4` | Core IPv4 support (required for everything else here) |
+| `proto-ipv4-fragmentation` | Enables fragmentation of outgoing packets and reassembly of incoming fragments |
+| `proto-dhcpv4` | Enables the DHCPv4 socket for dynamic address configuration |
+| `multicast` | Enables IGMPv1/v2 multicast group membership |
+
+## Setting an IPv4 address
+
+You assign IPv4 addresses to an interface using `update_ip_addrs`. Addresses are specified as
+CIDR blocks with a prefix length.
+
+```rust
+use smoltcp::wire::{IpAddress, IpCidr};
+
+iface.update_ip_addrs(|addrs| {
+    addrs
+        .push(IpCidr::new(IpAddress::v4(192, 168, 1, 10), 24))
+        .unwrap();
+});
+```
+
+The maximum number of addresses per interface is controlled by `IFACE_MAX_ADDR_COUNT` (default: 2).
+Increase it via a Cargo feature or the `SMOLTCP_IFACE_MAX_ADDR_COUNT` environment variable:
+
+```toml
+# Allow up to 4 addresses on one interface
+smoltcp = { version = "0.13.0", features = ["iface-max-addr-count-4"] }
+```
+
+## Routing
+
+smoltcp routes outgoing packets through a default gateway or a static CIDR route table.
+The route table holds both IPv4 and IPv6 routes; the capacity is controlled by
+`IFACE_MAX_ROUTE_COUNT` (default: 2).
+
+```rust
+use smoltcp::iface::{Route, Routes};
+use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
+
+// Add a default gateway (0.0.0.0/0)
+iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(192, 168, 1, 1)).unwrap();
+
+// Add a specific static route via routes_mut().update()
+iface.routes_mut().update(|table| {
+    table.push(Route {
+        cidr: IpCidr::new(IpAddress::v4(10, 0, 0, 0), 8),
+        via_router: IpAddress::v4(192, 168, 1, 1),
+        preferred_until: None,
+        expires_at: None,
+    }).unwrap();
+});
+```
+
+To increase route table capacity:
+
+```toml
+smoltcp = { version = "0.13.0", features = ["iface-max-route-count-8"] }
+```
+
+## Fragmentation and reassembly
+
+When `proto-ipv4-fragmentation` is enabled, smoltcp fragments outgoing packets that exceed
+the path MTU, and reassembles incoming fragmented packets before delivering them to sockets.
+
+Two compile-time settings control buffer sizes:
+
+| Setting | Default | Description |
+|---|---|---|
+| `FRAGMENTATION_BUFFER_SIZE` | 1500 | Maximum size of an outgoing packet before fragmentation. Packets larger than this are dropped. |
+| `REASSEMBLY_BUFFER_SIZE` | 1500 | Maximum size of a reassembled incoming packet. Fragments that would exceed this are dropped. |
+| `REASSEMBLY_BUFFER_COUNT` | 1 | How many fragmented packets can be reassembled simultaneously. |
+
+Configure via Cargo features or environment variables:
+
+```toml
+smoltcp = { version = "0.13.0", features = [
+    "fragmentation-buffer-size-4096",
+    "reassembly-buffer-size-4096",
+    "reassembly-buffer-count-4",
+] }
+```
+
+Or at build time:
+
+```bash
+SMOLTCP_FRAGMENTATION_BUFFER_SIZE=4096 cargo build
+```
+
+## IGMP multicast
+
+With the `multicast` feature, smoltcp supports IPv4 multicast via IGMPv1 and IGMPv2.
+Membership reports are sent in response to membership queries at intervals equal to the
+maximum response time divided by the number of groups being reported.
+
+```rust
+use smoltcp::wire::Ipv4Address;
+
+// Join a multicast group
+iface.join_multicast_group(Ipv4Address::new(224, 0, 0, 251)).unwrap();
+
+// Leave a multicast group
+iface.leave_multicast_group(Ipv4Address::new(224, 0, 0, 251)).unwrap();
+```
+
+The maximum number of multicast groups per interface is controlled by
+`IFACE_MAX_MULTICAST_GROUP_COUNT` (default: 4).
+
+## DHCP
+
+smoltcp includes a DHCPv4 client socket (`socket-dhcpv4`) that lets you obtain an address,
+subnet mask, and default gateway dynamically. See the `dhcp_client` example in the repository
+for a complete usage pattern.
+
+```toml
+smoltcp = { version = "0.13.0", features = ["proto-dhcpv4", "socket-dhcpv4"] }
+```

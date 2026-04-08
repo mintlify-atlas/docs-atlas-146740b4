@@ -1,0 +1,78 @@
+---
+title: "Examples overview"
+description: "Runnable examples demonstrating smoltcp features on Linux."
+---
+
+All examples run on Linux using a TAP network interface. Before running any example, set up a `tap0` interface as described in the [hosted Linux guide](/guides/hosted-linux).
+
+<Note>
+  Running examples requires a `tap0` interface configured on your system. The examples use hardware address `02-00-00-00-00-01` or `02-00-00-00-00-02` and operate in the `192.168.69.0/24` subnet by default.
+</Note>
+
+## Available examples
+
+<CardGroup cols={2}>
+  <Card title="server.rs" icon="server">
+    TCP/UDP server that responds on ports 6969–6972. Demonstrates listening, echoing, sinking, and sourcing data over multiple sockets simultaneously.
+  </Card>
+  <Card title="client.rs" icon="arrow-right-to-bracket">
+    TCP client that connects to a given address and port, then echoes received data back in reversed chunks.
+  </Card>
+  <Card title="httpclient.rs" icon="globe">
+    HTTP GET client over TCP. Connects to a given IP address and URL, sends an HTTP/1.1 request, and prints the response.
+  </Card>
+  <Card title="ping.rs" icon="signal">
+    ICMP echo request/reply utility. Sends a configurable number of pings to a target address and reports round-trip time and packet loss statistics.
+  </Card>
+  <Card title="tcpdump.rs" icon="magnifying-glass">
+    Raw socket packet capture, similar to the `tcpdump` utility. Works on any network interface, including `eth0`, `wlan0`, or `tap0`.
+  </Card>
+  <Card title="dhcp_client.rs" icon="network-wired">
+    DHCPv4 client that dynamically obtains an IP address, default gateway, and DNS servers from a DHCP server on the local network.
+  </Card>
+  <Card title="dns.rs" icon="at">
+    DNS resolver that queries a configured DNS server (defaults to `8.8.4.4` and `8.8.8.8`) and prints the resolved addresses for a given hostname.
+  </Card>
+  <Card title="loopback.rs" icon="rotate">
+    Loopback interface example that requires no OS networking. Opens a server and client TCP socket and transfers data between them — works without `std`.
+  </Card>
+  <Card title="benchmark.rs" icon="gauge-high">
+    Throughput benchmark that establishes a TCP connection to itself from a separate thread. Reports results in Gbps; typical results exceed 3 Gbps in reader mode and 7 Gbps in writer mode.
+  </Card>
+  <Card title="multicast.rs / multicast6.rs" icon="share-nodes">
+    IPv4 and IPv6 multicast examples demonstrating group membership and multicast UDP packet exchange over a TAP interface.
+  </Card>
+  <Card title="sixlowpan.rs" icon="microchip">
+    6LoWPAN over IEEE 802.15.4. Demonstrates compressed IPv6 header transmission over low-power wireless personal area networks using a raw socket.
+  </Card>
+  <Card title="slaac.rs" icon="address-card">
+    IPv6 Stateless Address Autoconfiguration (SLAAC). Demonstrates configuring an IPv6 address automatically from router advertisement prefixes.
+  </Card>
+</CardGroup>
+
+## Fault injection
+
+Every example supports fault injection through command-line options, letting you test smoltcp's resilience to adverse network conditions:
+
+| Option | Description |
+|---|---|
+| `--drop-chance CHANCE` | Randomly drop packets with the given probability in percent |
+| `--corrupt-chance CHANCE` | Randomly mutate one byte in a packet with the given probability in percent |
+| `--size-limit SIZE` | Drop packets larger than the given size in bytes |
+| `--tx-rate-limit RATE` | Limit outgoing packets per token bucket interval |
+| `--rx-rate-limit RATE` | Limit incoming packets per token bucket interval |
+| `--shaping-interval MS` | Set the token bucket refill interval in milliseconds |
+
+Good starting values are `--drop-chance 15` and `--corrupt-chance 15` for packet loss and corruption testing. Use `--tx-rate-limit 4 --shaping-interval 50` for rate limiting.
+
+<Tip>
+  Packets dropped by the fault injector still appear in the trace log. The message `rx: randomly dropping a packet` means the packet printed above it was dropped; `tx: randomly dropping a packet` means the packet printed below it was dropped.
+</Tip>
+
+## Packet capture
+
+All examples accept a `--pcap FILE` option that writes a libpcap-format capture file containing every packet as smoltcp sees it. Open the resulting file in [Wireshark](https://wireshark.org) to inspect the packet exchange.
+
+```bash
+cargo run --example server -- --tap tap0 --pcap server.pcap
+```

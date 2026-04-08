@@ -1,0 +1,240 @@
+---
+title: "Bare-metal usage"
+description: "Using smoltcp on embedded targets without an operating system."
+---
+
+smoltcp is designed from the ground up for bare-metal, real-time systems. It requires no heap allocator, no operating system, and no threading primitives — making it suitable for any target that can run Rust, from a Cortex-M0 up to more capable MCUs.
+
+## Why smoltcp fits bare-metal
+
+- **No heap allocation.** smoltcp never calls `malloc` or its Rust equivalents. All buffers are caller-supplied slices that you allocate statically or on the stack.
+- **No OS dependencies.** There are no threads, no mutexes, and no system calls. The stack is driven by a single `iface.poll()` call that you invoke from your main loop or interrupt handler.
+- **Stable Rust.** smoltcp compiles on stable Rust 1.91 and later (with the exception of the `defmt` feature, which requires a nightly compiler for certain configurations).
+- **Event-driven.** The stack tells you exactly when it next needs to be polled via `iface.poll_delay()`, so you can sleep the MCU until work is ready.
+
+## No-std configuration
+
+Disable the default feature set and enable only what your target needs:
+
+```toml
+[dependencies]
+smoltcp = { version = "0.13.0", default-features = false, features = [
+    "proto-ipv4",
+    "socket-tcp",
+    "medium-ethernet",
+    "defmt",
+] }
+```
+
+The `std` feature (enabled by default) pulls in `Box` and `Vec`. Without it, you must supply all buffers yourself as static slices — described in the next section.
+
+## Setting up the project
+
+<Steps>
+  <Step title="Add smoltcp with no-std features">
+    Create a `Cargo.toml` for a Cortex-M target. Choose `socket-tcp-reno` instead of `socket-tcp-cubic` if your MCU lacks an FPU (see the warning below).
+
+    ```toml
+    [package]
+    name = "my-firmware"
+    version = "0.1.0"
+    edition = "2024"
+
+    [dependencies]
+    smoltcp = { version = "0.13.0", default-features = false, features = [
+        "medium-ethernet",   # Ethernet frames with ARP
+        "proto-ipv4",        # IPv4 support
+        "socket-tcp",        # TCP sockets
+        "socket-udp",        # UDP sockets (optional)
+        "defmt",             # Embedded logging via defmt
+        "socket-tcp-reno",   # Reno congestion control (no FPU required)
+    ] }
+
+    [profile.release]
+    opt-level = "s"
+    lto = true
+    ```
+  </Step>
+
+  <Step title="Implement the Device trait">
+    smoltcp communicates with your hardware through the `phy::Device` trait. You implement it for your MCU's Ethernet peripheral or 802.15.4 radio. The trait uses a token pattern: `receive` returns a pair of `(RxToken, TxToken)` when a frame is available, and `transmit` returns a `TxToken` when the transmit buffer is free.
+
+    ```rust
+    use smoltcp::phy::{self, DeviceCapabilities, Device, Medium};
+    use smoltcp::time::Instant;
+
+    struct EthernetPhy {
+        rx_buffer: [u8; 1536],
+        tx_buffer: [u8; 1536],
+    }
+
+    impl EthernetPhy {
+        fn new() -> Self {
+            Self {
+                rx_buffer: [0; 1536],
+                tx_buffer: [0; 1536],
+            }
+        }
+    }
+
+    impl phy::Device for EthernetPhy {
+        type RxToken<'a> = EthernetRxToken<'a> where Self: 'a;
+        type TxToken<'a> = EthernetTxToken<'a> where Self: 'a;
+
+        fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+            // Return Some(...) only when a frame has been received by your peripheral.
+            Some((
+                EthernetRxToken(&mut self.rx_buffer[..]),
+                EthernetTxToken(&mut self.tx_buffer[..]),
+            ))
+        }
+
+        fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+            // Return Some(...) only when the transmit buffer is free.
+            Some(EthernetTxToken(&mut self.tx_buffer[..]))
+        }
+
+        fn capabilities(&self) -> DeviceCapabilities {
+            let mut caps = DeviceCapabilities::default();
+            caps.max_transmission_unit = 1536;
+            caps.max_burst_size = Some(1);
+            caps.medium = Medium::Ethernet;
+            caps
+        }
+    }
+
+    struct EthernetRxToken<'a>(&'a mut [u8]);
+
+    impl<'a> phy::RxToken for EthernetRxToken<'a> {
+        fn consume<R, F>(self, f: F) -> R
+        where
+            F: FnOnce(&[u8]) -> R,
+        {
+            // Copy the received frame into self.0 from the peripheral DMA buffer here.
+            f(self.0)
+        }
+    }
+
+    struct EthernetTxToken<'a>(&'a mut [u8]);
+
+    impl<'a> phy::TxToken for EthernetTxToken<'a> {
+        fn consume<R, F>(self, len: usize, f: F) -> R
+        where
+            F: FnOnce(&mut [u8]) -> R,
+        {
+            let result = f(&mut self.0[..len]);
+            // Trigger the DMA transmit here.
+            result
+        }
+    }
+    ```
+
+    The `timestamp` argument passed to `receive` and `transmit` is a monotonically increasing millisecond counter from an arbitrary start point (such as system startup). You are responsible for producing this value.
+  </Step>
+
+  <Step title="Allocate static buffers">
+    On heap-less systems, smoltcp expects you to hand it slices backed by static storage. Declare them as `static mut` arrays so they live for the lifetime of the program and so the linker can verify they fit in RAM.
+
+    ```rust
+    use smoltcp::socket::tcp;
+    use smoltcp::iface::SocketSet;
+
+    static mut TCP_RX_BUFFER: [u8; 1536] = [0; 1536];
+    static mut TCP_TX_BUFFER: [u8; 1536] = [0; 1536];
+
+    // Safety: these statics are only accessed through smoltcp after this point.
+    let tcp_rx = tcp::SocketBuffer::new(unsafe { &mut TCP_RX_BUFFER[..] });
+    let tcp_tx = tcp::SocketBuffer::new(unsafe { &mut TCP_TX_BUFFER[..] });
+    let socket = tcp::Socket::new(tcp_rx, tcp_tx);
+
+    // Socket storage for the SocketSet — also static.
+    let mut socket_storage: [_; 2] = Default::default();
+    let mut sockets = SocketSet::new(&mut socket_storage[..]);
+    let handle = sockets.add(socket);
+    ```
+  </Step>
+
+  <Step title="Create the interface">
+    Build an `Interface` from your device and an `IpCidr` address:
+
+    ```rust
+    use smoltcp::iface::{Config, Interface};
+    use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr};
+    use smoltcp::time::Instant;
+
+    let mac = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    let config = Config::new(mac.into());
+    let mut iface = Interface::new(config, &mut device, Instant::from_millis(0));
+
+    iface.update_ip_addrs(|addrs| {
+        addrs.push(IpCidr::new(IpAddress::v4(192, 168, 1, 1), 24)).unwrap();
+    });
+    ```
+  </Step>
+
+  <Step title="Run the main loop">
+    In your bare-metal main loop, call `iface.poll()` each iteration, then use `iface.poll_delay()` to determine how long you can sleep before the next poll is needed:
+
+    ```rust
+    use smoltcp::time::{Duration, Instant};
+
+    loop {
+        let now: Instant = /* read your hardware timer as milliseconds */ Instant::from_millis(0);
+
+        iface.poll(now, &mut device, &mut sockets);
+
+        // --- Handle socket events here ---
+
+        match iface.poll_delay(now, &sockets) {
+            Some(Duration::ZERO) => {
+                // Work is immediately available; loop without sleeping.
+            }
+            Some(delay) => {
+                // Sleep for `delay` milliseconds (use your MCU's WFI or a timer).
+                sleep_ms(delay.total_millis());
+            }
+            None => {
+                // No sockets are open; sleep indefinitely or until an interrupt.
+                wfi();
+            }
+        }
+    }
+    ```
+
+    `poll()` processes all pending received frames and drives TCP/IP state machines forward. It must be called with a monotonically increasing timestamp in milliseconds.
+  </Step>
+</Steps>
+
+## Logging
+
+smoltcp supports two embedded-friendly logging backends.
+
+**Using `defmt`** — add the `defmt` feature and wire up a `defmt` transport (RTT, UART, etc.) with your BSP. smoltcp emits TRACE-level messages for normal events (buffer levels, TCP state changes) and DEBUG-level messages for exceptional events (malformed packets).
+
+```toml
+smoltcp = { version = "0.13.0", default-features = false, features = [
+    "defmt",
+    # ... other features
+] }
+```
+
+**Using `log`** — add the `log` feature and connect a `log`-compatible backend such as `rtt-logger` or `cortex-m-log`. The `log` and `defmt` features are mutually exclusive.
+
+**Disabling logging entirely** — omit both `log` and `defmt`. smoltcp will compile with zero logging overhead.
+
+<Note>
+  The `verbose` feature enables very high-frequency log output — one line per octet read or written from a socket. Enable it only during debugging, as it will overwhelm most log transports on embedded targets.
+</Note>
+
+## Congestion control
+
+smoltcp offers two TCP congestion control algorithms selectable via Cargo features:
+
+| Feature | Algorithm | Notes |
+|---|---|---|
+| `socket-tcp-cubic` | CUBIC | Default when enabled. Uses `f64` floating-point. |
+| `socket-tcp-reno` | Reno | Integer-only arithmetic. |
+
+<Warning>
+  CUBIC relies on double-precision (`f64`) floating-point operations. Cortex-M0, Cortex-M1, and Cortex-M3 cores have no FPU — software emulation consumes significant CPU time and Flash space. Use `socket-tcp-reno` on any MCU without a hardware FPU. Interrupt handlers and kernel-mode code on any architecture should also prefer Reno to avoid saving and restoring FPU registers.
+</Warning>

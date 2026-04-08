@@ -1,0 +1,168 @@
+---
+title: "6LoWPAN"
+description: "IPv6 over IEEE 802.15.4 using 6LoWPAN compression in smoltcp."
+---
+
+6LoWPAN (IPv6 over Low-Power Wireless Personal Area Networks) is a set of compression and
+adaptation techniques that make IPv6 practical over IEEE 802.15.4 radio links. smoltcp
+implements 6LoWPAN compression (RFC 6282) and fragmentation (RFC 4944), making it suitable
+for IoT devices on 802.15.4 networks.
+
+## RFC compliance
+
+| RFC | Description | Status |
+|---|---|---|
+| [RFC 6282](https://tools.ietf.org/rfc/rfc6282.txt) | IPHC/NHC header compression | Supported |
+| [RFC 4944](https://tools.ietf.org/rfc/rfc4944.txt) | Fragmentation and reassembly | Supported |
+
+## Feature flags
+
+```toml
+[dependencies]
+smoltcp = { version = "0.13.0", default-features = false, features = [
+    "medium-ieee802154",             # IEEE 802.15.4 medium support (enables proto-sixlowpan)
+    "proto-sixlowpan",               # 6LoWPAN IPHC/NHC compression
+    "proto-sixlowpan-fragmentation", # optional: fragmentation/reassembly
+    "socket-udp",                    # or socket-tcp — at least one socket type
+] }
+```
+
+| Feature | Description |
+|---|---|
+| `medium-ieee802154` | Activates the IEEE 802.15.4 medium and automatically enables `proto-sixlowpan` |
+| `proto-sixlowpan` | IPHC and NHC header compression/decompression; requires `proto-ipv6` |
+| `proto-sixlowpan-fragmentation` | Fragmentation of outgoing frames and reassembly of incoming fragments |
+
+<Note>
+Uncompressed IPv6 Extension Headers in 6LoWPAN frames are not supported. All extension
+headers must be compressed using the NHC encoding.
+</Note>
+
+## Supported compression features
+
+- **IPHC** (IP Header Compression): compresses the IPv6 header by eliding fields that can
+  be inferred from the link-layer context or set to their default values.
+- **NHC** (Next Header Compression): compresses UDP headers and IPv6 extension headers
+  following the IPv6 header.
+- **Address context compression**: up to `IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT`
+  address contexts can be registered to enable context-based address compression.
+- **Fragmentation**: outgoing IPv6 packets larger than the 802.15.4 frame MTU (127 bytes)
+  are fragmented; incoming fragments are reassembled.
+
+## Address contexts
+
+6LoWPAN address contexts allow the stack to compress common address prefixes to a single
+byte. smoltcp supports up to `IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT` contexts per
+interface (default: 4).
+
+Configure the limit via a Cargo feature or environment variable:
+
+```toml
+smoltcp = { version = "0.13.0", features = ["iface-max-sixlowpan-address-context-count-8"] }
+```
+
+```bash
+SMOLTCP_IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT=8 cargo build
+```
+
+## Setting up a 6LoWPAN interface
+
+<Steps>
+  <Step title="Load the kernel module (Linux testing)">
+    For testing on Linux, use the `mac802154_hwsim` module to create virtual IEEE 802.15.4
+    radios:
+
+    ```bash
+    modprobe mac802154_hwsim
+
+    ip link set wpan0 down
+    ip link set wpan1 down
+    iwpan dev wpan0 set pan_id 0xbeef
+    iwpan dev wpan1 set pan_id 0xbeef
+    ip link add link wpan0 name lowpan0 type lowpan
+    ip link set wpan0 up
+    ip link set wpan1 up
+    ip link set lowpan0 up
+    ```
+
+    smoltcp uses `wpan1` (raw socket); Linux speaks 6LoWPAN on `wpan0`/`lowpan0`.
+  </Step>
+
+  <Step title="Open the raw socket">
+    Open an IEEE 802.15.4 raw socket on the `wpan1` interface:
+
+    ```rust
+    use smoltcp::phy::{Medium, RawSocket};
+
+    let device = RawSocket::new("wpan1", Medium::Ieee802154).unwrap();
+    ```
+  </Step>
+
+  <Step title="Configure the interface">
+    Create an `Interface` with an IEEE 802.15.4 hardware address and PAN ID:
+
+    ```rust
+    use smoltcp::iface::{Config, Interface, SocketSet};
+    use smoltcp::time::Instant;
+    use smoltcp::wire::{Ieee802154Address, Ieee802154Pan, IpAddress, IpCidr};
+
+    let mut config = Config::new(
+        Ieee802154Address::Extended([0x1a, 0x0b, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42]).into(),
+    );
+    config.random_seed = rand::random();
+    config.pan_id = Some(Ieee802154Pan(0xbeef));
+
+    let mut iface = Interface::new(config, &mut device, Instant::now());
+
+    // Assign a link-local IPv6 address
+    iface.update_ip_addrs(|addrs| {
+        addrs
+            .push(IpCidr::new(
+                IpAddress::v6(0xfe80, 0, 0, 0, 0x180b, 0x4242, 0x4242, 0x4242),
+                64,
+            ))
+            .unwrap();
+    });
+    ```
+  </Step>
+
+  <Step title="Create sockets and poll">
+    Socket creation and the poll loop work the same as for Ethernet or IP medium interfaces.
+    smoltcp handles 6LoWPAN compression and fragmentation transparently.
+
+    ```rust
+    use smoltcp::socket::udp;
+
+    let rx_buffer = udp::PacketBuffer::new(
+        vec![udp::PacketMetadata::EMPTY],
+        vec![0u8; 1280],
+    );
+    let tx_buffer = udp::PacketBuffer::new(
+        vec![udp::PacketMetadata::EMPTY],
+        vec![0u8; 1280],
+    );
+    let udp_socket = udp::Socket::new(rx_buffer, tx_buffer);
+    let mut sockets = SocketSet::new(vec![]);
+    let udp_handle = sockets.add(udp_socket);
+
+    loop {
+        let timestamp = Instant::now();
+        iface.poll(timestamp, &mut device, &mut sockets);
+        // process socket I/O ...
+    }
+    ```
+  </Step>
+</Steps>
+
+## Teardown (Linux)
+
+```bash
+rmmod mac802154_hwsim
+```
+
+## Use case
+
+6LoWPAN is the standard adaptation layer for IPv6 on IEEE 802.15.4 networks, used in protocols
+such as Thread, ZigBee IP, and 6TiSCH. smoltcp's 6LoWPAN support makes it suitable for
+constrained IoT devices — such as those based on nRF52840 or similar SoCs with 802.15.4 radios
+— that need to participate in IPv6 networks without a full-size stack.

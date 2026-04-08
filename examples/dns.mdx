@@ -1,0 +1,136 @@
+---
+title: "DNS resolution"
+description: "Using the DNS socket to resolve hostnames in smoltcp."
+---
+
+`dns.rs` demonstrates smoltcp's DNS socket. It configures two DNS servers (`8.8.4.4` and `8.8.8.8`), starts an `A` record query for a hostname you provide, and prints the resolved addresses when the query completes.
+
+## Prerequisites
+
+### Required features
+
+```toml
+required-features = ["std", "medium-ethernet", "medium-ip", "phy-tuntap_interface",
+                     "proto-ipv4", "socket-dns"]
+```
+
+The `socket-dns` feature enables `smoltcp::socket::dns`. It implicitly enables `proto-dns`.
+
+### TAP interface
+
+The example uses a standard routed `tap0` interface. Set one up as described in the [hosted Linux guide](/guides/hosted-linux), including the masquerade rules so that DNS queries can reach the internet:
+
+```bash
+sudo iptables -t nat -A POSTROUTING -s 192.168.69.0/24 -j MASQUERADE
+sudo sysctl net.ipv4.ip_forward=1
+```
+
+## How the DNS socket works
+
+You create a `dns::Socket` with a list of server addresses. Before entering the poll loop, you call `socket.start_query()` with the interface context, a hostname string, and a query type (`DnsQueryType::A` for IPv4, `DnsQueryType::Aaaa` for IPv6). This returns a query handle. On each iteration of the poll loop, you call `socket.get_query_result(query)` to check whether the query has completed.
+
+`get_query_result` returns:
+- `Ok(addrs)` — the query finished successfully; `addrs` contains the resolved addresses.
+- `Err(GetQueryResultError::Pending)` — the query is still in flight; continue polling.
+- `Err(e)` — the query failed with an error.
+
+## Socket creation
+
+```rust
+use smoltcp::socket::dns::{self, GetQueryResultError};
+use smoltcp::wire::{DnsQueryType, Ipv4Address};
+
+// Configure up to DNS_MAX_SERVER_COUNT servers (default: 1).
+// The example configures two servers, so DNS_MAX_SERVER_COUNT must be >= 2.
+let servers = &[
+    Ipv4Address::new(8, 8, 4, 4).into(),
+    Ipv4Address::new(8, 8, 8, 8).into(),
+];
+let dns_socket = dns::Socket::new(servers, vec![]);
+
+let mut sockets = SocketSet::new(vec![]);
+let dns_handle = sockets.add(dns_socket);
+```
+
+## Starting a query
+
+Call `start_query` once, before the poll loop, to issue the DNS request:
+
+```rust
+let socket = sockets.get_mut::<dns::Socket>(dns_handle);
+let query = socket
+    .start_query(iface.context(), name, DnsQueryType::A)
+    .unwrap();
+```
+
+`name` is a `&str` containing the hostname to resolve, taken from the command-line arguments.
+
+## Poll loop and result retrieval
+
+```rust
+loop {
+    let timestamp = Instant::now();
+    iface.poll(timestamp, &mut device, &mut sockets);
+
+    match sockets
+        .get_mut::<dns::Socket>(dns_handle)
+        .get_query_result(query)
+    {
+        Ok(addrs) => {
+            println!("Query done: {addrs:?}");
+            break;
+        }
+        Err(GetQueryResultError::Pending) => {} // not done yet
+        Err(e) => panic!("query failed: {e:?}"),
+    }
+
+    phy_wait(fd, iface.poll_delay(timestamp, &sockets)).expect("wait error");
+}
+```
+
+## DNS configuration options
+
+smoltcp's DNS socket has three compile-time size limits that you can tune via Cargo features or environment variables:
+
+| Setting | Default | Cargo feature example | Env variable |
+|---|---|---|---|
+| `DNS_MAX_RESULT_COUNT` | 1 | `dns-max-result-count-4` | `SMOLTCP_DNS_MAX_RESULT_COUNT=4` |
+| `DNS_MAX_SERVER_COUNT` | 1 | `dns-max-server-count-2` | `SMOLTCP_DNS_MAX_SERVER_COUNT=2` |
+| `DNS_MAX_NAME_SIZE` | 255 | `dns-max-name-size-128` | `SMOLTCP_DNS_MAX_NAME_SIZE=128` |
+
+`DNS_MAX_RESULT_COUNT` caps how many addresses are returned for a single query. If a hostname has four `A` records and this is set to `1`, only the first address is returned. `DNS_MAX_SERVER_COUNT` limits how many servers you can pass to `dns::Socket::new`. The `dns.rs` example passes two servers, so you need `DNS_MAX_SERVER_COUNT >= 2`.
+
+<Note>
+  The default feature set includes `dns-max-server-count-1`. To run the example as written with two servers, you either enable `dns-max-server-count-2` or set `SMOLTCP_DNS_MAX_SERVER_COUNT=2` at build time. The default feature set used when running examples is sufficient because the full default enables enough capacity.
+</Note>
+
+## Running the example
+
+<Steps>
+  <Step title="Set up tap0 with internet routing">
+    ```bash
+    sudo ip tuntap add name tap0 mode tap user $USER
+    sudo ip link set tap0 up
+    sudo ip addr add 192.168.69.100/24 dev tap0
+    sudo iptables -t nat -A POSTROUTING -s 192.168.69.0/24 -j MASQUERADE
+    sudo sysctl net.ipv4.ip_forward=1
+    ```
+  </Step>
+  <Step title="Run the DNS example">
+    Pass the hostname to resolve as the final positional argument:
+    ```bash
+    cargo run --example dns -- --tap tap0 example.org
+    ```
+  </Step>
+  <Step title="Read the output">
+    When the query completes, the example prints the resolved addresses and exits:
+    ```
+    Query done: [93.184.216.34]
+    ```
+    If you set `RUST_LOG=debug`, you will also see the outgoing DNS request and incoming response in the trace log.
+  </Step>
+</Steps>
+
+<Tip>
+  Use `--pcap dns.pcap` to capture the query and response packets. Open the file in Wireshark and filter on `dns` to see the full exchange.
+</Tip>

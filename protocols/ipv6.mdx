@@ -1,0 +1,196 @@
+---
+title: "IPv6"
+description: "IPv6 protocol support in smoltcp: addressing, SLAAC, multicast, and 6LoWPAN."
+---
+
+smoltcp supports IPv6 over Ethernet, IP, and IEEE 802.15.4 (via 6LoWPAN) media. The implementation
+covers unicast and multicast routing, neighbor discovery, stateless address autoconfiguration,
+and optional hop-by-hop extension headers.
+
+## Supported features
+
+- Configurable hop limit, defaulting to 64 per the IANA recommendation
+- Default gateway and CIDR routing for outgoing packets
+- Hop-by-hop extension header parsing (`proto-ipv6-hbh`)
+- ICMPv6 parameter problem generation for unrecognized next headers
+- Neighbor Discovery Protocol (NDISC): solicitations, advertisements, and router solicitations
+- Stateless Address Autoconfiguration (`proto-ipv6-slaac`)
+- IPv6 multicast group membership
+- 6LoWPAN compressed IPv6 over IEEE 802.15.4 (`proto-sixlowpan`)
+
+<Note>
+Router Advertisement messages are read but not generated. Redirected Header messages are
+neither generated nor read.
+</Note>
+
+## Feature flags
+
+```toml
+[dependencies]
+smoltcp = { version = "0.13.0", default-features = false, features = [
+    "proto-ipv6",
+    "proto-ipv6-hbh",           # optional: hop-by-hop header parsing
+    "proto-ipv6-fragmentation",  # optional: fragmentation/reassembly
+    "proto-ipv6-slaac",          # optional: stateless address autoconfiguration
+    "proto-ipv6-routing",        # optional: IPv6 routing extension header
+] }
+```
+
+| Feature | Description |
+|---|---|
+| `proto-ipv6` | Core IPv6 support (required for everything else here) |
+| `proto-ipv6-hbh` | Hop-by-hop options extension header |
+| `proto-ipv6-fragmentation` | Fragmentation and reassembly |
+| `proto-ipv6-slaac` | Stateless address autoconfiguration via router advertisements |
+| `proto-ipv6-routing` | IPv6 routing extension header |
+
+## Setting an IPv6 address
+
+You assign IPv6 addresses to an interface using `update_ip_addrs`, specifying the address as
+a CIDR block.
+
+```rust
+use smoltcp::wire::{IpAddress, IpCidr};
+
+iface.update_ip_addrs(|addrs| {
+    // Global unicast address
+    addrs
+        .push(IpCidr::new(
+            IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+            64,
+        ))
+        .unwrap();
+});
+```
+
+The maximum number of addresses per interface is controlled by `IFACE_MAX_ADDR_COUNT` (default: 2).
+
+## Routing
+
+smoltcp routes IPv6 packets through a default gateway or a static CIDR route table shared
+with IPv4. The capacity is controlled by `IFACE_MAX_ROUTE_COUNT` (default: 2).
+
+```rust
+use smoltcp::wire::Ipv6Address;
+
+// Add a default gateway
+iface.routes_mut().add_default_ipv6_route(
+    Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)
+).unwrap();
+```
+
+## NDISC
+
+smoltcp implements the Neighbor Discovery Protocol automatically when `proto-ipv6` is enabled.
+You do not need to manage neighbor discovery manually.
+
+- **Neighbor Solicitations** trigger **Neighbor Advertisement** responses — smoltcp handles
+  both sending and receiving.
+- **Router Solicitation** messages are sent at startup (up to 3 times, 4 seconds apart) when
+  `proto-ipv6-slaac` is enabled, to discover routers on the link.
+- **Router Advertisement** messages received from routers are processed to install routes and
+  prefixes (used by SLAAC).
+
+## SLAAC
+
+<AccordionGroup>
+  <Accordion title="How SLAAC works">
+    Stateless Address Autoconfiguration (RFC 4862) allows a device to configure its own IPv6
+    address without a DHCP server. smoltcp implements SLAAC via the `Slaac` struct in
+    `src/iface/slaac.rs`.
+
+    The process works as follows:
+
+    <Steps>
+      <Step title="Router solicitation">
+        At startup, smoltcp sends Router Solicitation (RS) messages to the all-routers multicast
+        address (`ff02::2`). Up to 3 solicitations are sent at 4-second intervals.
+      </Step>
+      <Step title="Router advertisement">
+        A router responds with a Router Advertisement (RA) containing prefix information. smoltcp
+        reads the RA and extracts the advertised prefix and default gateway.
+      </Step>
+      <Step title="Address formation">
+        smoltcp combines the received prefix with the interface's Extended Unique Identifier (EUI-64)
+        derived from the hardware address to form a global unicast address. The address is added
+        to the interface automatically.
+      </Step>
+      <Step title="Route installation">
+        The default gateway and prefix routes from the RA are installed into the route table with
+        their advertised valid lifetimes.
+      </Step>
+    </Steps>
+
+    Up to `IFACE_MAX_PREFIX_COUNT` prefixes can be tracked (default: 1). Increase this if you
+    need to track multiple prefixes:
+
+    ```toml
+    smoltcp = { version = "0.13.0", features = ["iface-max-prefix-count-4"] }
+    ```
+  </Accordion>
+
+  <Accordion title="Enabling SLAAC">
+    Add `proto-ipv6-slaac` to your features. No additional code is required — smoltcp
+    performs router solicitation and address assignment automatically on the first call
+    to `Interface::poll`.
+
+    ```toml
+    smoltcp = { version = "0.13.0", features = ["proto-ipv6", "proto-ipv6-slaac"] }
+    ```
+
+    You can observe the current SLAAC phase (Start, Discovering, Maintaining, None) and
+    the assigned addresses by reading the interface's address list after polling:
+
+    ```rust
+    for addr in iface.ip_addrs() {
+        if let IpCidr::Ipv6(cidr) = addr {
+            // Address configured via SLAAC or statically assigned
+        }
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## IPv6 multicast
+
+smoltcp supports IPv6 multicast group membership. Solicited-node multicast addresses are
+joined automatically for each unicast address assigned to the interface.
+
+```rust
+use smoltcp::wire::Ipv6Address;
+
+// Join a multicast group (e.g., all-nodes: ff02::1)
+iface.join_multicast_group(
+    Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 1)
+).unwrap();
+
+// Leave a multicast group
+iface.leave_multicast_group(
+    Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 1)
+).unwrap();
+```
+
+The maximum number of multicast groups per interface is controlled by
+`IFACE_MAX_MULTICAST_GROUP_COUNT` (default: 4).
+
+## Hop-by-hop options
+
+When `proto-ipv6-hbh` is enabled, smoltcp parses the Hop-by-Hop Options extension header.
+The maximum number of options that can be parsed per header is controlled by
+`IPV6_HBH_MAX_OPTIONS` (default: 4).
+
+<Note>
+An ICMPv6 Parameter Problem message is generated when smoltcp encounters an unrecognized
+IPv6 next header type. However, no Parameter Problem is generated for unknown hop-by-hop
+options within a recognized header.
+</Note>
+
+Configure the option limit via a Cargo feature or environment variable:
+
+```toml
+smoltcp = { version = "0.13.0", features = ["ipv6-hbh-max-options-8"] }
+```
+
+```bash
+SMOLTCP_IPV6_HBH_MAX_OPTIONS=8 cargo build
+```
